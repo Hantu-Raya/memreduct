@@ -46,3 +46,47 @@ typedef struct _MOUNTMGR_MOUNT_POINTS
 	(s)->Buffer[29] == L'-' && (s)->Buffer[34] == L'-' && (s)->Buffer[47] == L'}')
 
 typedef PMOUNTMGR_MOUNT_POINTS *PMOUNTMGR_MOUNT_POINTS_PTR;
+
+//
+// Memory list information (SystemMemoryListInformation query)
+//
+
+typedef struct _APP_SYSTEM_MEMORY_LIST_INFORMATION
+{
+	SIZE_T ZeroPageCount;
+	SIZE_T FreePageCount;
+	SIZE_T ModifiedPageCount;
+	SIZE_T ModifiedNoWritePageCount;
+	SIZE_T BadPageCount;
+	SIZE_T PageCountByPriority[8];
+	SIZE_T RepurposedPagesByPriority[8];
+	SIZE_T ModifiedPageCountPageFile;
+} APP_SYSTEM_MEMORY_LIST_INFORMATION, *PAPP_SYSTEM_MEMORY_LIST_INFORMATION;
+
+//
+// Volume device characteristics (wdm.h / winioctl.h)
+//
+
+#ifndef FILE_REMOVABLE_MEDIA
+#define FILE_REMOVABLE_MEDIA 0x00000001
+#endif // FILE_REMOVABLE_MEDIA
+
+#ifndef FILE_READ_ONLY_DEVICE
+#define FILE_READ_ONLY_DEVICE 0x00000002
+#endif // FILE_READ_ONLY_DEVICE
+
+#ifndef FILE_FLOPPY_DISKETTE
+#define FILE_FLOPPY_DISKETTE 0x00000004
+#endif // FILE_FLOPPY_DISKETTE
+
+#ifndef FILE_REMOTE_DEVICE
+#define FILE_REMOTE_DEVICE 0x00000010
+#endif // FILE_REMOTE_DEVICE
+
+#ifndef FILE_DEVICE_DISK
+#define FILE_DEVICE_DISK 0x00000007
+#endif // FILE_DEVICE_DISK
+
+#ifndef FILE_DEVICE_VIRTUAL_DISK
+#define FILE_DEVICE_VIRTUAL_DISK 0x00000024
+#endif // FILE_DEVICE_VIRTUAL_DISK

@@ -27,6 +27,28 @@ DEFINE_GUID (GUID_TrayIcon, 0xAE9053F0, 0x8D59, 0x4803, 0x9A, 0xBB, 0x74, 0xAF, 
 // minimum pause (in seconds) between usage-based automatic cleanups
 #define AUTOREDUCT_COOLDOWN 30
 
+// pagefile guard: skip modified page list flush when pagefile usage is at or above this percent
+#define DEFAULT_PAGEFILE_GUARD 90
+
+// smart standby purge (ISLC-style): purge standby when standby >= X MB and free < Y MB
+#define DEFAULT_SMART_STANDBY_MB 1024
+#define DEFAULT_SMART_FREE_MB 1024
+#define SMART_COOLDOWN 30
+
+// posted by the cleaning worker thread when it has finished
+#define RM_CLEANDONE (WM_APP + 0x100)
+
+#define APP_MAX_PAGEFILES 16
+
+// main listview rows
+#define LV_ROW_COMMIT 9
+#define LV_ROW_LISTS 12
+#define LV_ROW_PAGEFILES 15
+
+#define LV_GROUP_COMMIT 3
+#define LV_GROUP_LISTS 4
+#define LV_GROUP_PAGEFILES 5
+
 #define DEFAULT_DANGER_LEVEL 90
 #define DEFAULT_WARNING_LEVEL 70
 
@@ -70,6 +92,9 @@ typedef struct _STATIC_DATA
 	HFONT hfont;
 	RECT icon_size;
 	ULONG ms_prev;
+	ULONG pagefile_rows;
+	LONG64 smart_last;
+	volatile LONG is_cleaning;
 } STATIC_DATA, *PSTATIC_DATA;
 
 typedef enum _CLEANUP_SOURCE_ENUM
@@ -77,7 +102,46 @@ typedef enum _CLEANUP_SOURCE_ENUM
 	SOURCE_AUTO,
 	SOURCE_MANUAL,
 	SOURCE_HOTKEY,
-	SOURCE_CMDLINE
+	SOURCE_CMDLINE,
+	SOURCE_SMART
 } CLEANUP_SOURCE_ENUM, *PCLEANUP_SOURCE_ENUM;
+
+typedef struct _APP_PAGEFILE
+{
+	WCHAR name[128];
+	ULONG64 total_bytes;
+	ULONG64 used_bytes;
+	ULONG64 peak_bytes;
+	ULONG64 min_bytes;
+	ULONG64 max_bytes;
+} APP_PAGEFILE, *PAPP_PAGEFILE;
+
+typedef struct _APP_MEMORY_EX
+{
+	ULONG64 commit_used;
+	ULONG64 commit_limit;
+	ULONG64 commit_peak;
+	ULONG64 standby_bytes;
+	ULONG64 modified_bytes;
+	ULONG64 modified_pagefile_bytes;
+	ULONG64 free_bytes;
+	BOOLEAN is_lists_valid;
+	ULONG pagefile_count;
+	APP_PAGEFILE pagefiles[APP_MAX_PAGEFILES];
+} APP_MEMORY_EX, *PAPP_MEMORY_EX;
+
+// everything the cleaning worker needs, captured on the UI thread
+typedef struct _APP_CLEAN_CONTEXT
+{
+	HWND hwnd;
+	PR_STRING exclusions;
+	ULONG64 freed_bytes;
+	CLEANUP_SOURCE_ENUM src;
+	ULONG mask;
+	ULONG pagefile_guard;
+	ULONG notification_flags;
+	WCHAR regions[0x200];
+	WCHAR notes[0x100];
+} APP_CLEAN_CONTEXT, *PAPP_CLEAN_CONTEXT;
 
 

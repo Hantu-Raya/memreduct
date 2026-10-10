@@ -14,6 +14,24 @@ STATIC_DATA config = {0};
 ULONG limits_arr[13] = {0};
 ULONG intervals_arr[13] = {0};
 
+// main listview layout: group titles and labels of the fixed rows (3 rows per group)
+static const ULONG app_group_titles[] = {
+	IDS_GROUP_1,
+	IDS_GROUP_2,
+	IDS_GROUP_3,
+	IDS_GROUP_COMMIT,
+	IDS_GROUP_LISTS,
+	IDS_GROUP_PAGEFILES,
+};
+
+static const ULONG app_row_labels[LV_ROW_PAGEFILES] = {
+	IDS_ITEM_1, IDS_ITEM_2, IDS_ITEM_3, // physical memory
+	IDS_ITEM_1, IDS_ITEM_2, IDS_ITEM_3, // pagefile
+	IDS_ITEM_1, IDS_ITEM_2, IDS_ITEM_3, // system working set
+	IDS_ITEM_1, IDS_ITEM_2, IDS_ITEM_LIMIT, // commit charge
+	IDS_ITEM_STANDBY, IDS_ITEM_MODIFIED, IDS_ITEM_FREE, // memory lists
+};
+
 INT WINAPIV compare_numbers (
 	_In_opt_ PVOID context,
 	_In_ LPCVOID ptr1,
@@ -171,6 +189,267 @@ ULONG64 _app_getmemoryinfo (
 	return mem_info->physical_memory.used_bytes;
 }
 
+ULONG _app_getpagesize ()
+{
+	static ULONG page_size = 0;
+	SYSTEM_BASIC_INFORMATION sbi = {0};
+
+	if (!page_size)
+	{
+		if (NT_SUCCESS (NtQuerySystemInformation (SystemBasicInformation, &sbi, sizeof (sbi), NULL)) && sbi.PageSize)
+		{
+			page_size = sbi.PageSize;
+		}
+		else
+		{
+			return PAGE_SIZE;
+		}
+	}
+
+	return page_size;
+}
+
+// Commit charge, memory lists and every pagefile individually.
+VOID _app_getmemoryinfo_ex (
+	_Out_ PAPP_MEMORY_EX out_buffer
+)
+{
+	SYSTEM_PERFORMANCE_INFORMATION perf_info = {0};
+	APP_SYSTEM_MEMORY_LIST_INFORMATION mli = {0};
+	PSYSTEM_PAGEFILE_INFORMATION_EX pagefile;
+	ULONG64 buffer[0x400]; // 8 KB, 8-byte aligned
+	PAPP_PAGEFILE entry;
+	ULONG64 standby_pages = 0;
+	ULONG page_size;
+	ULONG offset = 0;
+	ULONG name_length;
+	PWCHAR name;
+	BOOLEAN is_ex = TRUE;
+	NTSTATUS status;
+
+	RtlZeroMemory (out_buffer, sizeof (APP_MEMORY_EX));
+
+	page_size = _app_getpagesize ();
+
+	if (NT_SUCCESS (NtQuerySystemInformation (SystemPerformanceInformation, &perf_info, sizeof (perf_info), NULL)))
+	{
+		out_buffer->commit_used = (ULONG64)perf_info.CommittedPages * page_size;
+		out_buffer->commit_limit = (ULONG64)perf_info.CommitLimit * page_size;
+		out_buffer->commit_peak = (ULONG64)perf_info.PeakCommitment * page_size;
+	}
+
+	// requires SeProfileSingleProcessPrivilege (elevated)
+	if (NT_SUCCESS (NtQuerySystemInformation (SystemMemoryListInformation, &mli, sizeof (mli), NULL)))
+	{
+		for (ULONG i = 0; i < RTL_NUMBER_OF (mli.PageCountByPriority); i++)
+			standby_pages += mli.PageCountByPriority[i];
+
+		out_buffer->standby_bytes = standby_pages * page_size;
+		out_buffer->modified_bytes = (ULONG64)mli.ModifiedPageCount * page_size;
+		out_buffer->modified_pagefile_bytes = (ULONG64)mli.ModifiedPageCountPageFile * page_size;
+		out_buffer->free_bytes = ((ULONG64)mli.FreePageCount + (ULONG64)mli.ZeroPageCount) * page_size;
+
+		out_buffer->is_lists_valid = TRUE;
+	}
+
+	// SystemPageFileInformationEx adds configured min/max sizes (win8+)
+	status = NtQuerySystemInformation (SystemPageFileInformationEx, buffer, sizeof (buffer), NULL);
+
+	if (!NT_SUCCESS (status))
+	{
+		is_ex = FALSE;
+
+		status = NtQuerySystemInformation (SystemPageFileInformation, buffer, sizeof (buffer), NULL);
+	}
+
+	if (!NT_SUCCESS (status))
+		return;
+
+	while (out_buffer->pagefile_count < APP_MAX_PAGEFILES && offset + sizeof (SYSTEM_PAGEFILE_INFORMATION) <= sizeof (buffer))
+	{
+		pagefile = PTR_ADD_OFFSET (buffer, offset);
+
+		// no pagefile configured: a single zeroed record
+		if (!pagefile->TotalSize)
+			break;
+
+		entry = &out_buffer->pagefiles[out_buffer->pagefile_count++];
+
+		entry->total_bytes = (ULONG64)pagefile->TotalSize * page_size;
+		entry->used_bytes = (ULONG64)pagefile->TotalInUse * page_size;
+		entry->peak_bytes = (ULONG64)pagefile->PeakUsage * page_size;
+
+		if (is_ex && offset + sizeof (SYSTEM_PAGEFILE_INFORMATION_EX) <= sizeof (buffer))
+		{
+			entry->min_bytes = (ULONG64)pagefile->MinimumSize * page_size;
+			entry->max_bytes = (ULONG64)pagefile->MaximumSize * page_size;
+		}
+
+		name = pagefile->PageFileName.Buffer;
+		name_length = pagefile->PageFileName.Length / sizeof (WCHAR);
+
+		// the name must point inside our buffer
+		if (name && (ULONG_PTR)name >= (ULONG_PTR)buffer && (ULONG_PTR)(name + name_length) <= (ULONG_PTR)buffer + sizeof (buffer))
+		{
+			// "\??\C:\pagefile.sys" -> "C:\pagefile.sys"
+			if (name_length >= 4 && name[0] == L'\\' && name[1] == L'?' && name[2] == L'?' && name[3] == L'\\')
+			{
+				name += 4;
+				name_length -= 4;
+			}
+
+			name_length = min (name_length, RTL_NUMBER_OF (entry->name) - 1);
+
+			RtlCopyMemory (entry->name, name, name_length * sizeof (WCHAR));
+
+			entry->name[name_length] = UNICODE_NULL;
+		}
+		else
+		{
+			_r_str_printf (entry->name, RTL_NUMBER_OF (entry->name), L"#%" TEXT (PR_ULONG), out_buffer->pagefile_count);
+		}
+
+		if (!pagefile->NextEntryOffset)
+			break;
+
+		offset += pagefile->NextEntryOffset;
+	}
+}
+
+// Caller frees the returned buffer with _r_mem_free.
+_Ret_maybenull_
+PSYSTEM_PROCESS_INFORMATION _app_queryprocesses ()
+{
+	PVOID buffer;
+	ULONG buffer_length = 0x40000;
+	ULONG return_length = 0;
+	NTSTATUS status;
+
+	buffer = _r_mem_allocate (buffer_length);
+
+	for (ULONG attempts = 0; attempts < 8; attempts++)
+	{
+		status = NtQuerySystemInformation (SystemProcessInformation, buffer, buffer_length, &return_length);
+
+		if (status != STATUS_INFO_LENGTH_MISMATCH && status != STATUS_BUFFER_TOO_SMALL)
+			break;
+
+		buffer_length = max (buffer_length * 2, return_length + 0x10000);
+		buffer = _r_mem_reallocate (buffer, buffer_length);
+	}
+
+	if (!NT_SUCCESS (status))
+	{
+		_r_mem_free (buffer);
+
+		return NULL;
+	}
+
+	return buffer;
+}
+
+// "game.exe; obs64.exe, foo.exe" (case-insensitive image names)
+BOOLEAN _app_isprocessexcluded (
+	_In_ PR_STRING exclusions,
+	_In_ PUNICODE_STRING image_name
+)
+{
+	PWCHAR ptr = exclusions->buffer;
+	PWCHAR token;
+	ULONG_PTR length;
+	ULONG_PTR name_length;
+
+	if (!image_name->Buffer)
+		return FALSE;
+
+	name_length = image_name->Length / sizeof (WCHAR);
+
+	while (*ptr)
+	{
+		while (*ptr == L';' || *ptr == L',' || *ptr == L' ' || *ptr == L'\t')
+			ptr++;
+
+		token = ptr;
+
+		while (*ptr && *ptr != L';' && *ptr != L',')
+			ptr++;
+
+		length = ptr - token;
+
+		while (length && (token[length - 1] == L' ' || token[length - 1] == L'\t'))
+			length--;
+
+		if (length && length == name_length && _wcsnicmp (token, image_name->Buffer, length) == 0)
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+// Per-process working set trim that honors the "WorkingSetExclusions" list.
+VOID _app_trimworkingsets (
+	_In_ PR_STRING exclusions
+)
+{
+	PSYSTEM_PROCESS_INFORMATION processes;
+	PSYSTEM_PROCESS_INFORMATION process;
+	HANDLE hprocess;
+	ULONG pid;
+
+	processes = _app_queryprocesses ();
+
+	if (!processes)
+		return;
+
+	process = processes;
+
+	while (TRUE)
+	{
+		pid = HandleToUlong (process->UniqueProcessId);
+
+		if (pid > 4 && pid != HandleToUlong (NtCurrentProcessId ()) && !_app_isprocessexcluded (exclusions, &process->ImageName))
+		{
+			hprocess = OpenProcess (PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+
+			if (hprocess)
+			{
+				SetProcessWorkingSetSizeEx (hprocess, (SIZE_T)-1, (SIZE_T)-1, 0);
+
+				CloseHandle (hprocess);
+			}
+		}
+
+		if (!process->NextEntryOffset)
+			break;
+
+		process = PTR_ADD_OFFSET (process, process->NextEntryOffset);
+	}
+
+	_r_mem_free (processes);
+}
+
+#define APP_MM_KEY L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management"
+
+BOOLEAN _app_isclearpagefileenabled ()
+{
+	ULONG value = 0;
+	ULONG size = sizeof (value);
+
+	if (RegGetValueW (HKEY_LOCAL_MACHINE, APP_MM_KEY, L"ClearPageFileAtShutdown", RRF_RT_REG_DWORD, NULL, &value, &size) != ERROR_SUCCESS)
+		return FALSE;
+
+	return (value != 0);
+}
+
+LSTATUS _app_setclearpagefile (
+	_In_ BOOLEAN is_enable
+)
+{
+	ULONG value = is_enable ? 1 : 0;
+
+	return RegSetKeyValueW (HKEY_LOCAL_MACHINE, APP_MM_KEY, L"ClearPageFileAtShutdown", REG_DWORD, &value, sizeof (value));
+}
+
 FORCEINLINE LPCWSTR _app_getcleanupreason (
 	_In_ CLEANUP_SOURCE_ENUM src
 )
@@ -195,6 +474,11 @@ FORCEINLINE LPCWSTR _app_getcleanupreason (
 		case SOURCE_CMDLINE:
 		{
 			return L"Cleanup (Command-line)";
+		}
+
+		case SOURCE_SMART:
+		{
+			return L"Cleanup (Smart standby)";
 		}
 
 		default:
@@ -243,6 +527,52 @@ NTSTATUS _app_getvolumemountpoints (
 	return status;
 }
 
+// Opens the volume without mounting a filesystem and checks the device characteristics.
+BOOLEAN _app_isfixedvolume (
+	_In_ PUNICODE_STRING volume_name
+)
+{
+	FILE_FS_DEVICE_INFORMATION fdi = {0};
+	OBJECT_ATTRIBUTES oa = {0};
+	IO_STATUS_BLOCK isb;
+	HANDLE hvolume;
+	NTSTATUS status;
+
+	InitializeObjectAttributes (&oa, volume_name, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+	status = NtCreateFile (
+		&hvolume,
+		FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+		&oa,
+		&isb,
+		NULL,
+		FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		FILE_OPEN,
+		FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+		NULL,
+		0
+	);
+
+	if (!NT_SUCCESS (status))
+		return FALSE;
+
+	status = NtQueryVolumeInformationFile (hvolume, &isb, &fdi, sizeof (fdi), FileFsDeviceInformation);
+
+	NtClose (hvolume);
+
+	if (!NT_SUCCESS (status))
+		return FALSE;
+
+	if (fdi.DeviceType != FILE_DEVICE_DISK && fdi.DeviceType != FILE_DEVICE_VIRTUAL_DISK)
+		return FALSE;
+
+	if (fdi.Characteristics & (FILE_REMOVABLE_MEDIA | FILE_READ_ONLY_DEVICE | FILE_FLOPPY_DISKETTE | FILE_REMOTE_DEVICE))
+		return FALSE;
+
+	return TRUE;
+}
+
 NTSTATUS _app_flushvolumecache ()
 {
 	PMOUNTMGR_MOUNT_POINTS object_mountpoints;
@@ -287,7 +617,8 @@ NTSTATUS _app_flushvolumecache ()
 		us.MaximumLength = mountpoint->SymbolicLinkNameLength + sizeof (UNICODE_NULL);
 		us.Buffer = PTR_ADD_OFFSET (object_mountpoints, mountpoint->SymbolicLinkNameOffset);
 
-		if (MOUNTMGR_IS_VOLUME_NAME (&us)) // \\??\\Volume{1111-2222}
+		// fixed local disks only: flushing removable, network or offline volumes can stall for seconds
+		if (MOUNTMGR_IS_VOLUME_NAME (&us) && _app_isfixedvolume (&us)) // \\??\\Volume{1111-2222}
 		{
 			InitializeObjectAttributes (&oa, &us, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
@@ -323,122 +654,18 @@ CleanupExit:
 	return status;
 }
 
-VOID _app_memoryclean (
-	_In_opt_ HWND hwnd,
-	_In_ CLEANUP_SOURCE_ENUM src,
-	_In_opt_ ULONG mask
+// Runs on the worker thread (or inline for command-line cleaning). No UI and no config access here.
+VOID _app_memoryclean_perform (
+	_Inout_ PAPP_CLEAN_CONTEXT context
 )
 {
-	WCHAR buffer_cleaned_result[0x100] = {0}, buffer_region[0x100] = {0}, buffer_result[0x100] = {0};
 	MEMORY_COMBINE_INFORMATION_EX combine_info_ex = {0};
 	SYSTEM_FILECACHE_INFORMATION sfci = {0};
 	SYSTEM_MEMORY_LIST_COMMAND command;
 	R_MEMORY_INFO mem_info;
 	ULONG64 reduct_after, reduct_before;
-	ULONG flags = NIIF_WARNING;
+	ULONG mask = context->mask;
 	NTSTATUS status;
-
-	if (!_r_config_getboolean_ex (L"IsNotificationsSound", TRUE, NULL))
-		flags |= NIIF_NOSOUND;
-
-	if (!_r_sys_iselevated ())
-	{
-		if (_r_app_runasadmin ())
-		{
-			if (hwnd)
-				DestroyWindow (hwnd);
-		}
-		else
-		{
-			if (src == SOURCE_CMDLINE)
-			{
-				if (hwnd)
-					_r_show_message (hwnd, MB_OK | MB_ICONSTOP, _r_locale_getstring (IDS_STATUS_NOPRIVILEGES), NULL);
-			}
-			else
-			{
-				if (hwnd)
-					_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), _r_locale_getstring (IDS_STATUS_NOPRIVILEGES));
-			}
-		}
-
-		return;
-	}
-
-	if (mask == 0)
-		mask = _r_config_getulong_ex (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
-
-	if (src == SOURCE_AUTO)
-	{
-		if (!_r_config_getboolean_ex (L"IsAllowStandbyListCleanup", FALSE, NULL))
-			mask &= ~REDUCT_MASK_FREEZES; // exclude freezes from autoclean feature ;)
-	}
-
-	if ((mask & REDUCT_WORKINGSET) == REDUCT_WORKINGSET)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_WORKINGSET));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_SYSTEMFILECACHE) == REDUCT_SYSTEMFILECACHE)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_SYSTEMFILECACHE));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_MODIFIEDFILECACHE) == REDUCT_MODIFIEDFILECACHE)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_MODIFIEDFILECACHE));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"*\r\n");
-	}
-
-	if ((mask & REDUCT_STANDBYLIST) == REDUCT_STANDBYLIST)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_STANDBYLIST));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"*\r\n");
-	}
-
-	if ((mask & REDUCT_STANDBYPRIORITY0LIST) == REDUCT_STANDBYPRIORITY0LIST)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_STANDBYLISTPRIORITY0));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_appendformat (buffer_region, RTL_NUMBER_OF (buffer_region), L"%s (win8.1+)", _r_locale_getstring (IDS_MEMREGION_REGISTRYCACHE));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	if ((mask & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS)
-	{
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"- ");
-		_r_str_appendformat (buffer_region, RTL_NUMBER_OF (buffer_region), L"%s (win10+)", _r_locale_getstring (IDS_MEMREGION_COMBINEMEMORYLISTS));
-		_r_str_append (buffer_region, RTL_NUMBER_OF (buffer_region), L"\r\n");
-	}
-
-	StrTrimW (buffer_region, L"\r\n");
-
-	if (src == SOURCE_MANUAL)
-	{
-		if (!_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_QUESTION), buffer_region, L"IsShowReductConfirmation", FALSE))
-			return;
-	}
-
-	SetCursor (LoadCursorW (NULL, IDC_WAIT));
 
 	// difference (before)
 	reduct_before = _app_getmemoryinfo (&mem_info);
@@ -446,12 +673,19 @@ VOID _app_memoryclean (
 	// Working set (vista+)
 	if ((mask & REDUCT_WORKINGSET) == REDUCT_WORKINGSET)
 	{
-		command = MemoryEmptyWorkingSets;
+		if (context->exclusions && !_r_obj_isstringempty (context->exclusions))
+		{
+			_app_trimworkingsets (context->exclusions);
+		}
+		else
+		{
+			command = MemoryEmptyWorkingSets;
 
-		status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
+			status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
 
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", status, L"MemoryEmptyWorkingSets");
+			if (!NT_SUCCESS (status))
+				_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", status, L"MemoryEmptyWorkingSets");
+		}
 	}
 
 	// System file cache
@@ -466,19 +700,34 @@ VOID _app_memoryclean (
 			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", status, L"SystemFileCacheInformation");
 	}
 
-	// Flush volume cache
+	// Flush volume cache (fixed volumes only)
 	if ((mask & REDUCT_MODIFIEDFILECACHE) == REDUCT_MODIFIEDFILECACHE)
 		_app_flushvolumecache ();
 
 	// Modified page list (vista+)
 	if ((mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST)
 	{
-		command = MemoryFlushModifiedList;
+		// pagefile guard: flushing writes pagefile-backed modified pages into the pagefile,
+		// so skip it when the pagefile is already nearly full
+		if (context->pagefile_guard && mem_info.page_file.total_bytes && mem_info.page_file.percent >= context->pagefile_guard)
+		{
+			_r_str_printf (
+				context->notes,
+				RTL_NUMBER_OF (context->notes),
+				L"%s: skipped, pagefile %" TEXT (PR_ULONG) L"%% full",
+				_r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST),
+				mem_info.page_file.percent
+			);
+		}
+		else
+		{
+			command = MemoryFlushModifiedList;
 
-		status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
+			status = NtSetSystemInformation (SystemMemoryListInformation, &command, sizeof (SYSTEM_MEMORY_LIST_COMMAND));
 
-		if (!NT_SUCCESS (status))
-			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", status, L"MemoryFlushModifiedList");
+			if (!NT_SUCCESS (status))
+				_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", status, L"MemoryFlushModifiedList");
+		}
 	}
 
 	// Standby list (vista+)
@@ -521,26 +770,37 @@ VOID _app_memoryclean (
 			_r_log (LOG_LEVEL_ERROR, NULL, L"NtSetSystemInformation", status, L"SystemCombinePhysicalMemoryInformation");
 	}
 
-	SetCursor (LoadCursorW (NULL, IDC_ARROW));
-
 	// difference (after)
 	reduct_after = _app_getmemoryinfo (&mem_info);
 
-	reduct_after = (reduct_after < reduct_before) ? (reduct_before - reduct_after) : 0;
+	context->freed_bytes = (reduct_after < reduct_before) ? (reduct_before - reduct_after) : 0;
+}
+
+// Runs on the UI thread: report results and release the context.
+VOID _app_memoryclean_finish (
+	_In_ PAPP_CLEAN_CONTEXT context
+)
+{
+	WCHAR buffer_cleaned_result[0x100] = {0}, buffer_result[0x400] = {0};
+	HWND hwnd = context->hwnd;
+	CLEANUP_SOURCE_ENUM src = context->src;
 
 	// time of last cleaning
 	_r_config_setlong64_ex (L"StatisticLastReduct", _r_unixtime_now (), NULL);
 
-	_r_format_bytesize64 (buffer_cleaned_result, RTL_NUMBER_OF (buffer_cleaned_result), reduct_after);
+	_r_format_bytesize64 (buffer_cleaned_result, RTL_NUMBER_OF (buffer_cleaned_result), context->freed_bytes);
 
 	_r_str_printf (buffer_result, RTL_NUMBER_OF (buffer_result), _r_locale_getstring (IDS_STATUS_CLEANED), buffer_cleaned_result);
-	_r_str_printf (buffer_result, RTL_NUMBER_OF (buffer_result), L"%s\r\n\r\n%s:\r\n%s", buffer_result, _r_locale_getstring (IDS_TITLE_3), buffer_region);
+	_r_str_appendformat (buffer_result, RTL_NUMBER_OF (buffer_result), L"\r\n\r\n%s:\r\n%s", _r_locale_getstring (IDS_TITLE_3), context->regions);
+
+	if (context->notes[0])
+		_r_str_appendformat (buffer_result, RTL_NUMBER_OF (buffer_result), L"\r\n\r\n%s", context->notes);
 
 	if (src == SOURCE_CMDLINE)
 	{
 		if (_r_config_getboolean_ex (L"BalloonCleanResults", TRUE, NULL))
 		{
-			if (!_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), buffer_result))
+			if (!hwnd || !_r_tray_popup (hwnd, &GUID_TrayIcon, context->notification_flags, _r_app_getname (), buffer_result))
 				_r_show_message (hwnd, MB_OK | MB_ICONINFORMATION, _r_locale_getstring (IDS_SETTINGS_MEMORY), buffer_result);
 		}
 		else
@@ -548,14 +808,179 @@ VOID _app_memoryclean (
 			_r_show_message (hwnd, MB_OK | MB_ICONINFORMATION, _r_locale_getstring (IDS_SETTINGS_MEMORY), buffer_result);
 		}
 	}
-	else
+	else if (src != SOURCE_SMART) // smart standby purge stays silent, like ISLC
 	{
 		if (hwnd && _r_config_getboolean_ex (L"BalloonCleanResults", TRUE, NULL))
-			_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), buffer_result);
+			_r_tray_popup (hwnd, &GUID_TrayIcon, context->notification_flags, _r_app_getname (), buffer_result);
 	}
 
 	if (_r_config_getboolean_ex (L"LogCleanResults", FALSE, NULL))
 		_r_log_v (LOG_LEVEL_INFO, NULL, _app_getcleanupreason (src), 0, L"%s", buffer_cleaned_result);
+
+	if (hwnd)
+		_r_ctrl_enable (hwnd, IDC_CLEAN, TRUE);
+
+	if (context->exclusions)
+		_r_obj_dereference (context->exclusions);
+
+	_r_mem_free (context);
+
+	InterlockedExchange (&config.is_cleaning, FALSE);
+}
+
+DWORD WINAPI _app_memoryclean_thread (
+	_In_ PVOID lparam
+)
+{
+	PAPP_CLEAN_CONTEXT context = lparam;
+
+	_app_memoryclean_perform (context);
+
+	// the UI thread reports results and frees the context
+	if (!PostMessageW (context->hwnd, RM_CLEANDONE, 0, (LPARAM)context))
+	{
+		if (context->exclusions)
+			_r_obj_dereference (context->exclusions);
+
+		_r_mem_free (context);
+
+		InterlockedExchange (&config.is_cleaning, FALSE);
+	}
+
+	return 0;
+}
+
+VOID _app_appendregion (
+	_Inout_updates_ (buffer_length) LPWSTR buffer,
+	_In_ ULONG_PTR buffer_length,
+	_In_ LPCWSTR name,
+	_In_opt_ LPCWSTR suffix
+)
+{
+	_r_str_appendformat (buffer, buffer_length, L"- %s%s\r\n", name, suffix ? suffix : L"");
+}
+
+VOID _app_memoryclean (
+	_In_opt_ HWND hwnd,
+	_In_ CLEANUP_SOURCE_ENUM src,
+	_In_opt_ ULONG mask
+)
+{
+	WCHAR buffer_region[0x200] = {0};
+	PAPP_CLEAN_CONTEXT context;
+	HANDLE hthread;
+	ULONG flags = NIIF_WARNING;
+
+	if (!_r_config_getboolean_ex (L"IsNotificationsSound", TRUE, NULL))
+		flags |= NIIF_NOSOUND;
+
+	if (!_r_sys_iselevated ())
+	{
+		if (_r_app_runasadmin ())
+		{
+			if (hwnd)
+				DestroyWindow (hwnd);
+		}
+		else
+		{
+			if (src == SOURCE_CMDLINE)
+			{
+				if (hwnd)
+					_r_show_message (hwnd, MB_OK | MB_ICONSTOP, _r_locale_getstring (IDS_STATUS_NOPRIVILEGES), NULL);
+			}
+			else
+			{
+				if (hwnd)
+					_r_tray_popup (hwnd, &GUID_TrayIcon, flags, _r_app_getname (), _r_locale_getstring (IDS_STATUS_NOPRIVILEGES));
+			}
+		}
+
+		return;
+	}
+
+	// a cleaning is already running on the worker thread
+	if (config.is_cleaning)
+		return;
+
+	if (mask == 0)
+		mask = _r_config_getulong_ex (L"ReductMask2", REDUCT_MASK_DEFAULT, NULL);
+
+	if (src == SOURCE_AUTO)
+	{
+		if (!_r_config_getboolean_ex (L"IsAllowStandbyListCleanup", FALSE, NULL))
+			mask &= ~REDUCT_MASK_FREEZES; // exclude freezes from autoclean feature ;)
+	}
+
+	if ((mask & REDUCT_WORKINGSET) == REDUCT_WORKINGSET)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_WORKINGSET), NULL);
+
+	if ((mask & REDUCT_SYSTEMFILECACHE) == REDUCT_SYSTEMFILECACHE)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_SYSTEMFILECACHE), NULL);
+
+	if ((mask & REDUCT_MODIFIEDFILECACHE) == REDUCT_MODIFIEDFILECACHE)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_MODIFIEDFILECACHE), NULL);
+
+	if ((mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST), L"*");
+
+	if ((mask & REDUCT_STANDBYLIST) == REDUCT_STANDBYLIST)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_STANDBYLIST), L"*");
+
+	if ((mask & REDUCT_STANDBYPRIORITY0LIST) == REDUCT_STANDBYPRIORITY0LIST)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_STANDBYLISTPRIORITY0), NULL);
+
+	if ((mask & REDUCT_REGISTRYCACHE) == REDUCT_REGISTRYCACHE)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_REGISTRYCACHE), L" (win8.1+)");
+
+	if ((mask & REDUCT_COMBINEMEMORYLISTS) == REDUCT_COMBINEMEMORYLISTS)
+		_app_appendregion (buffer_region, RTL_NUMBER_OF (buffer_region), _r_locale_getstring (IDS_MEMREGION_COMBINEMEMORYLISTS), L" (win10+)");
+
+	StrTrimW (buffer_region, L"\r\n");
+
+	if (src == SOURCE_MANUAL)
+	{
+		if (!_r_show_confirmmessage (hwnd, _r_locale_getstring (IDS_QUESTION), buffer_region, L"IsShowReductConfirmation", FALSE))
+			return;
+	}
+
+	if (InterlockedCompareExchange (&config.is_cleaning, TRUE, FALSE))
+		return;
+
+	// prevents the usage-based autoclean from re-triggering while the worker runs
+	_r_config_setlong64_ex (L"StatisticLastReduct", _r_unixtime_now (), NULL);
+
+	context = _r_mem_allocate (sizeof (APP_CLEAN_CONTEXT));
+
+	context->hwnd = hwnd;
+	context->src = src;
+	context->mask = mask;
+	context->notification_flags = flags;
+	context->exclusions = _r_config_getstring_ex (L"WorkingSetExclusions", NULL, NULL);
+
+	if (_r_config_getboolean_ex (L"PagefileGuardEnable", TRUE, NULL))
+		context->pagefile_guard = _r_calc_clamp (_r_config_getulong_ex (L"PagefileGuardPercent", DEFAULT_PAGEFILE_GUARD, NULL), 1, 100);
+
+	_r_str_copy (context->regions, RTL_NUMBER_OF (context->regions), buffer_region);
+
+	hthread = NULL;
+
+	// cleaning can take tens of seconds on large systems (issue #312): keep the UI responsive
+	if (hwnd)
+	{
+		_r_ctrl_enable (hwnd, IDC_CLEAN, FALSE);
+
+		hthread = CreateThread (NULL, 0, &_app_memoryclean_thread, context, 0, NULL);
+	}
+
+	if (hthread)
+	{
+		NtClose (hthread);
+	}
+	else
+	{
+		_app_memoryclean_perform (context);
+		_app_memoryclean_finish (context);
+	}
 }
 
 VOID _app_fontinit (
@@ -707,6 +1132,120 @@ HICON _app_iconcreate (
 	return hicon;
 }
 
+VOID _app_setrow (
+	_In_ HWND hwnd,
+	_In_ INT item_id,
+	_In_ LPWSTR text,
+	_In_ ULONG percent
+)
+{
+	_r_listview_setitem (hwnd, IDC_LISTVIEW, item_id, 1, text, I_DEFAULT, I_DEFAULT, (LPARAM)percent);
+}
+
+VOID _app_setrowbytes (
+	_In_ HWND hwnd,
+	_In_ INT item_id,
+	_In_ ULONG64 bytes,
+	_In_ ULONG percent
+)
+{
+	WCHAR buffer[0x40];
+
+	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), bytes);
+
+	_app_setrow (hwnd, item_id, buffer, percent);
+}
+
+VOID _app_setrowpercent (
+	_In_ HWND hwnd,
+	_In_ INT item_id,
+	_In_ DOUBLE percent_f
+)
+{
+	WCHAR buffer[0x40];
+
+	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%" TEXT (PR_DOUBLE) L"%%", percent_f);
+
+	_app_setrow (hwnd, item_id, buffer, (ULONG)percent_f);
+}
+
+ULONG _app_percentof (
+	_In_ ULONG64 value,
+	_In_ ULONG64 total
+)
+{
+	if (!total)
+		return 0;
+
+	return (ULONG)PR_CALC_PERCENTOF (value, total);
+}
+
+// one row per pagefile, rebuilt only when the pagefile set changes
+VOID _app_updatepagefilerows (
+	_In_ HWND hwnd,
+	_In_ PAPP_MEMORY_EX mem_ex
+)
+{
+	WCHAR used_text[0x40], total_text[0x40], buffer[0x100];
+	PAPP_PAGEFILE pagefile;
+
+	if (config.pagefile_rows != mem_ex->pagefile_count)
+	{
+		while (_r_listview_getitemcount (hwnd, IDC_LISTVIEW) > LV_ROW_PAGEFILES)
+			_r_listview_deleteitem (hwnd, IDC_LISTVIEW, LV_ROW_PAGEFILES);
+
+		for (ULONG i = 0; i < mem_ex->pagefile_count; i++)
+			_r_listview_additem (hwnd, IDC_LISTVIEW, LV_ROW_PAGEFILES + i, mem_ex->pagefiles[i].name, I_DEFAULT, LV_GROUP_PAGEFILES, 0);
+
+		config.pagefile_rows = mem_ex->pagefile_count;
+	}
+
+	for (ULONG i = 0; i < mem_ex->pagefile_count; i++)
+	{
+		pagefile = &mem_ex->pagefiles[i];
+
+		_r_format_bytesize64 (used_text, RTL_NUMBER_OF (used_text), pagefile->used_bytes);
+		_r_format_bytesize64 (total_text, RTL_NUMBER_OF (total_text), pagefile->total_bytes);
+
+		_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%s / %s", used_text, total_text);
+
+		_r_listview_setitem (hwnd, IDC_LISTVIEW, LV_ROW_PAGEFILES + i, 0, pagefile->name, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+
+		_app_setrow (hwnd, LV_ROW_PAGEFILES + i, buffer, _app_percentof (pagefile->used_bytes, pagefile->total_bytes));
+	}
+}
+
+// ISLC-style trigger: purge standby only when it is large AND free memory is low
+VOID _app_checksmartstandby (
+	_In_ HWND hwnd,
+	_In_ PAPP_MEMORY_EX mem_ex
+)
+{
+	ULONG64 standby_limit, free_limit;
+	LONG64 now;
+
+	if (!mem_ex->is_lists_valid || config.is_cleaning)
+		return;
+
+	if (!_r_config_getboolean_ex (L"SmartStandbyEnable", FALSE, NULL))
+		return;
+
+	standby_limit = (ULONG64)_r_config_getulong_ex (L"SmartStandbyListMB", DEFAULT_SMART_STANDBY_MB, NULL) * 1048576ULL;
+	free_limit = (ULONG64)_r_config_getulong_ex (L"SmartStandbyFreeMB", DEFAULT_SMART_FREE_MB, NULL) * 1048576ULL;
+
+	if (mem_ex->standby_bytes < standby_limit || mem_ex->free_bytes >= free_limit)
+		return;
+
+	now = _r_unixtime_now ();
+
+	if (now - config.smart_last < SMART_COOLDOWN)
+		return;
+
+	config.smart_last = now;
+
+	_app_memoryclean (hwnd, SOURCE_SMART, REDUCT_STANDBYLIST);
+}
+
 VOID CALLBACK _app_timercallback (
 	_In_ HWND hwnd,
 	_In_ UINT msg,
@@ -715,19 +1254,26 @@ VOID CALLBACK _app_timercallback (
 )
 {
 	R_MEMORY_INFO mem_info;
-	WCHAR buffer[0x80];
+	APP_MEMORY_EX mem_ex;
 	HICON hicon = NULL;
 	LONG64 timestamp;
-	ULONG percent;
+	ULONG commit_percent;
+	DOUBLE commit_percent_f = 0.0;
 	BOOLEAN is_clean = FALSE;
 
 	if (id_event != UID)
 		return;
 
 	_app_getmemoryinfo (&mem_info);
+	_app_getmemoryinfo_ex (&mem_ex);
+
+	if (mem_ex.commit_limit)
+		commit_percent_f = PR_CALC_PERCENTOF (mem_ex.commit_used, mem_ex.commit_limit);
+
+	commit_percent = (ULONG)commit_percent_f;
 
 	// autocleanup functional
-	if (_r_sys_iselevated ())
+	if (_r_sys_iselevated () && !config.is_cleaning)
 	{
 		if (_r_config_getboolean_ex (L"AutoreductEnable", FALSE, NULL))
 		{
@@ -750,7 +1296,13 @@ VOID CALLBACK _app_timercallback (
 		}
 
 		if (is_clean)
+		{
 			_app_memoryclean (hwnd, SOURCE_AUTO, 0);
+		}
+		else
+		{
+			_app_checksmartstandby (hwnd, &mem_ex);
+		}
 	}
 
 	// check previous percent to prevent icon redraw
@@ -765,11 +1317,13 @@ VOID CALLBACK _app_timercallback (
 		hwnd,
 		&GUID_TrayIcon,
 		hicon,
-		L"%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%",
+		L"%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%\r\n%s: %" TEXT (PR_DOUBLE) L"%%",
 		_r_locale_getstring (IDS_GROUP_1),
 		mem_info.physical_memory.percent_f,
 		_r_locale_getstring (IDS_GROUP_2),
 		mem_info.page_file.percent_f,
+		_r_locale_getstring (IDS_GROUP_COMMIT),
+		commit_percent_f,
 		_r_locale_getstring (IDS_GROUP_3),
 		mem_info.system_cache.percent_f
 	);
@@ -777,54 +1331,40 @@ VOID CALLBACK _app_timercallback (
 	if (!_r_wnd_isvisible (hwnd, FALSE))
 		return;
 
-	// set item lparam information
-	for (INT i = 0; i < _r_listview_getitemcount (hwnd, IDC_LISTVIEW); i++)
-	{
-		if (i < 3)
-		{
-			percent = mem_info.physical_memory.percent;
-		}
-		else if (i < 6)
-		{
-			percent = mem_info.page_file.percent;
-		}
-		else if (i < 9)
-		{
-			percent = mem_info.system_cache.percent;
-		}
-
-		_r_listview_setitem (hwnd, IDC_LISTVIEW, i, 0, NULL, I_DEFAULT, I_DEFAULT, (LPARAM)percent);
-	}
-
 	// physical memory
-	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%" TEXT (PR_DOUBLE) L"%%", mem_info.physical_memory.percent_f);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 0, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	_app_setrowpercent (hwnd, 0, mem_info.physical_memory.percent_f);
+	_app_setrowbytes (hwnd, 1, mem_info.physical_memory.free_bytes, mem_info.physical_memory.percent);
+	_app_setrowbytes (hwnd, 2, mem_info.physical_memory.total_bytes, mem_info.physical_memory.percent);
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.physical_memory.free_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 1, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
-
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.physical_memory.total_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 2, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
-
-	// pagefile
-	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%" TEXT (PR_DOUBLE) L"%%", mem_info.page_file.percent_f);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 3, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
-
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.page_file.free_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 4, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
-
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.page_file.total_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 5, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	// pagefile (all pagefiles)
+	_app_setrowpercent (hwnd, 3, mem_info.page_file.percent_f);
+	_app_setrowbytes (hwnd, 4, mem_info.page_file.free_bytes, mem_info.page_file.percent);
+	_app_setrowbytes (hwnd, 5, mem_info.page_file.total_bytes, mem_info.page_file.percent);
 
 	// system cache
-	_r_str_printf (buffer, RTL_NUMBER_OF (buffer), L"%" TEXT (PR_DOUBLE) L"%%", mem_info.system_cache.percent_f);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 6, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	_app_setrowpercent (hwnd, 6, mem_info.system_cache.percent_f);
+	_app_setrowbytes (hwnd, 7, mem_info.system_cache.free_bytes, mem_info.system_cache.percent);
+	_app_setrowbytes (hwnd, 8, mem_info.system_cache.total_bytes, mem_info.system_cache.percent);
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.system_cache.free_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 7, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	// commit charge ("virtual memory" in 3.4 and Task Manager "Committed")
+	_app_setrowpercent (hwnd, LV_ROW_COMMIT, commit_percent_f);
+	_app_setrowbytes (hwnd, LV_ROW_COMMIT + 1, (mem_ex.commit_limit > mem_ex.commit_used) ? (mem_ex.commit_limit - mem_ex.commit_used) : 0, commit_percent);
+	_app_setrowbytes (hwnd, LV_ROW_COMMIT + 2, mem_ex.commit_limit, commit_percent);
 
-	_r_format_bytesize64 (buffer, RTL_NUMBER_OF (buffer), mem_info.system_cache.total_bytes);
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, 8, 1, buffer, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	// memory lists
+	if (mem_ex.is_lists_valid)
+	{
+		_app_setrowbytes (hwnd, LV_ROW_LISTS, mem_ex.standby_bytes, 0);
+		_app_setrowbytes (hwnd, LV_ROW_LISTS + 1, mem_ex.modified_bytes, 0);
+		_app_setrowbytes (hwnd, LV_ROW_LISTS + 2, mem_ex.free_bytes, 0);
+	}
+	else
+	{
+		for (INT i = 0; i < 3; i++)
+			_app_setrow (hwnd, LV_ROW_LISTS + i, L"n/a", 0);
+	}
+
+	_app_updatepagefilerows (hwnd, &mem_ex);
 
 	_r_listview_redraw (hwnd, IDC_LISTVIEW);
 }
@@ -1736,6 +2276,151 @@ INT_PTR CALLBACK SettingsProc (
 	return FALSE;
 }
 
+typedef struct _APP_PAGEFILE_CONSUMER
+{
+	ULONG64 bytes;
+	ULONG pid;
+	WCHAR name[64];
+} APP_PAGEFILE_CONSUMER, *PAPP_PAGEFILE_CONSUMER;
+
+#define APP_TOP_CONSUMERS 12
+
+// Who holds the pagefile: per pagefile usage, commit charge, and the processes with the
+// most private memory that is not in RAM (paged out to the pagefile or compressed).
+VOID _app_showpagefilereport (
+	_In_opt_ HWND hwnd
+)
+{
+	APP_PAGEFILE_CONSUMER top[APP_TOP_CONSUMERS] = {0};
+	WCHAR a[0x40], b[0x40], c[0x40], d[0x40];
+	PSYSTEM_PROCESS_INFORMATION processes;
+	PSYSTEM_PROCESS_INFORMATION process;
+	APP_MEMORY_EX mem_ex;
+	PAPP_PAGEFILE pagefile;
+	ULONG64 private_bytes, resident_bytes, bytes;
+	ULONG name_length;
+	ULONG count = 0;
+	ULONG pos;
+	PWCHAR buffer;
+	ULONG_PTR buffer_length = 0x2000;
+
+	_app_getmemoryinfo_ex (&mem_ex);
+
+	buffer = _r_mem_allocate (buffer_length * sizeof (WCHAR));
+
+	_r_str_append (buffer, buffer_length, L"Pagefiles:\r\n");
+
+	if (!mem_ex.pagefile_count)
+		_r_str_append (buffer, buffer_length, L"  (no pagefile)\r\n");
+
+	for (ULONG i = 0; i < mem_ex.pagefile_count; i++)
+	{
+		pagefile = &mem_ex.pagefiles[i];
+
+		_r_format_bytesize64 (a, RTL_NUMBER_OF (a), pagefile->used_bytes);
+		_r_format_bytesize64 (b, RTL_NUMBER_OF (b), pagefile->total_bytes);
+		_r_format_bytesize64 (c, RTL_NUMBER_OF (c), pagefile->peak_bytes);
+
+		_r_str_appendformat (buffer, buffer_length, L"  %s: %s in use of %s (peak %s)", pagefile->name, a, b, c);
+
+		if (pagefile->max_bytes)
+		{
+			_r_format_bytesize64 (a, RTL_NUMBER_OF (a), pagefile->min_bytes);
+			_r_format_bytesize64 (b, RTL_NUMBER_OF (b), pagefile->max_bytes);
+
+			_r_str_appendformat (buffer, buffer_length, L", size %s - %s", a, b);
+		}
+
+		_r_str_append (buffer, buffer_length, L"\r\n");
+	}
+
+	_r_format_bytesize64 (a, RTL_NUMBER_OF (a), mem_ex.commit_used);
+	_r_format_bytesize64 (b, RTL_NUMBER_OF (b), mem_ex.commit_limit);
+	_r_format_bytesize64 (c, RTL_NUMBER_OF (c), mem_ex.commit_peak);
+
+	_r_str_appendformat (buffer, buffer_length, L"\r\nCommit charge: %s of %s (peak %s)\r\n", a, b, c);
+
+	if (mem_ex.is_lists_valid)
+	{
+		_r_format_bytesize64 (d, RTL_NUMBER_OF (d), mem_ex.modified_pagefile_bytes);
+
+		_r_str_appendformat (buffer, buffer_length, L"Modified pages waiting to be written to the pagefile: %s\r\n", d);
+	}
+
+	processes = _app_queryprocesses ();
+
+	if (processes)
+	{
+		process = processes;
+
+		while (TRUE)
+		{
+			private_bytes = process->PrivatePageCount;
+			resident_bytes = (ULONG64)process->WorkingSetPrivateSize.QuadPart;
+
+			bytes = (private_bytes > resident_bytes) ? (private_bytes - resident_bytes) : 0;
+
+			if (HandleToUlong (process->UniqueProcessId) && bytes)
+			{
+				// insertion into a small sorted array
+				pos = count;
+
+				while (pos > 0 && top[pos - 1].bytes < bytes)
+				{
+					if (pos < APP_TOP_CONSUMERS)
+						top[pos] = top[pos - 1];
+
+					pos -= 1;
+				}
+
+				if (pos < APP_TOP_CONSUMERS)
+				{
+					top[pos].bytes = bytes;
+					top[pos].pid = HandleToUlong (process->UniqueProcessId);
+
+					name_length = min (process->ImageName.Length / sizeof (WCHAR), RTL_NUMBER_OF (top[pos].name) - 1);
+
+					if (process->ImageName.Buffer)
+						RtlCopyMemory (top[pos].name, process->ImageName.Buffer, name_length * sizeof (WCHAR));
+
+					top[pos].name[name_length] = UNICODE_NULL;
+
+					if (count < APP_TOP_CONSUMERS)
+						count += 1;
+				}
+			}
+
+			if (!process->NextEntryOffset)
+				break;
+
+			process = PTR_ADD_OFFSET (process, process->NextEntryOffset);
+		}
+
+		_r_mem_free (processes);
+	}
+
+	_r_str_append (buffer, buffer_length, L"\r\nPrivate memory not in RAM (pagefile or compressed), by process:\r\n");
+
+	for (ULONG i = 0; i < count; i++)
+	{
+		_r_format_bytesize64 (a, RTL_NUMBER_OF (a), top[i].bytes);
+
+		_r_str_appendformat (buffer, buffer_length, L"  %s  %s (%" TEXT (PR_ULONG) L")\r\n", a, top[i].name, top[i].pid);
+	}
+
+	_r_str_append (
+		buffer,
+		buffer_length,
+		L"\r\nWindows frees pagefile space only when the owning process frees or modifies that memory, "
+		L"or exits. Restarting the processes listed above releases their share; "
+		L"\"Wipe pagefile at shutdown\" zeroes the file at every shutdown."
+	);
+
+	_r_show_message (hwnd, MB_OK | MB_ICONINFORMATION, _r_locale_getstring (IDS_PAGEFILE_REPORT), buffer);
+
+	_r_mem_free (buffer);
+}
+
 VOID _app_resizecolumns (
 	_In_ HWND hwnd
 )
@@ -1776,16 +2461,14 @@ VOID _app_initialize (
 
 	_app_resizecolumns (hwnd);
 
-	// configure listview
-	for (INT i = 0, k = 0; i < 3; i++)
-	{
-		_r_listview_addgroup (hwnd, IDC_LISTVIEW, i, _r_locale_getstring (IDS_GROUP_1 + i), 0, LVGS_COLLAPSIBLE, LVGS_COLLAPSIBLE);
+	// configure listview (pagefile rows are added by the timer)
+	for (INT i = 0; i < RTL_NUMBER_OF (app_group_titles); i++)
+		_r_listview_addgroup (hwnd, IDC_LISTVIEW, i, _r_locale_getstring (app_group_titles[i]), 0, LVGS_COLLAPSIBLE, LVGS_COLLAPSIBLE);
 
-		for (INT j = 0; j < 3; j++)
-		{
-			_r_listview_additem (hwnd, IDC_LISTVIEW, k++, _r_locale_getstring (IDS_ITEM_1 + j), I_DEFAULT, i, 0);
-		}
-	}
+	for (INT i = 0; i < RTL_NUMBER_OF (app_row_labels); i++)
+		_r_listview_additem (hwnd, IDC_LISTVIEW, i, _r_locale_getstring (app_row_labels[i]), I_DEFAULT, i / 3, 0);
+
+	config.pagefile_rows = 0;
 
 	// settings
 	_r_settings_addpage (IDD_SETTINGS_GENERAL, IDS_SETTINGS_GENERAL);
@@ -1841,9 +2524,15 @@ INT_PTR CALLBACK DlgProc (
 				_r_menu_checkitem (hmenu, IDM_REDUCTCONFIRMATION_CHK, 0, MF_BYCOMMAND, _r_config_getboolean_ex (L"IsShowReductConfirmation", TRUE, NULL));
 				_r_menu_checkitem (hmenu, IDM_SKIPUACWARNING_CHK, 0, MF_BYCOMMAND, _r_skipuac_isenabled ());
 				_r_menu_checkitem (hmenu, IDM_CHECKUPDATES_CHK, 0, MF_BYCOMMAND, _r_update_isenabled (FALSE));
+				_r_menu_checkitem (hmenu, IDM_SMARTSTANDBY_CHK, 0, MF_BYCOMMAND, _r_config_getboolean_ex (L"SmartStandbyEnable", FALSE, NULL));
+				_r_menu_checkitem (hmenu, IDM_PAGEFILEGUARD_CHK, 0, MF_BYCOMMAND, _r_config_getboolean_ex (L"PagefileGuardEnable", TRUE, NULL));
+				_r_menu_checkitem (hmenu, IDM_CLEARPAGEFILE_CHK, 0, MF_BYCOMMAND, _app_isclearpagefileenabled ());
 
 				if (!_r_sys_iselevated ())
+				{
 					_r_menu_enableitem (hmenu, IDM_SKIPUACWARNING_CHK, FALSE, FALSE);
+					_r_menu_enableitem (hmenu, IDM_CLEARPAGEFILE_CHK, FALSE, FALSE);
+				}
 			}
 
 			_app_iconinit (_r_dc_gettaskbardpi ());
@@ -1901,18 +2590,35 @@ INT_PTR CALLBACK DlgProc (
 				_r_menu_setitemtext (hmenu, IDM_WEBSITE, FALSE, _r_locale_getstring (IDS_WEBSITE));
 				_r_menu_setitemtext (hmenu, IDM_CHECKUPDATES, FALSE, _r_locale_getstring (IDS_CHECKUPDATES));
 				_r_menu_setitemtextformat (hmenu, IDM_ABOUT, FALSE, L"%s\tF1", _r_locale_getstring (IDS_ABOUT));
+
+				_r_menu_setitemtextformat (hmenu, IDM_PAGEFILE_REPORT, FALSE, L"%s...", _r_locale_getstring (IDS_PAGEFILE_REPORT));
+
+				_r_menu_setitemtextformat (
+					hmenu,
+					IDM_SMARTSTANDBY_CHK,
+					FALSE,
+					_r_locale_getstring (IDS_SMARTSTANDBY_CHK),
+					_r_config_getulong_ex (L"SmartStandbyListMB", DEFAULT_SMART_STANDBY_MB, NULL),
+					_r_config_getulong_ex (L"SmartStandbyFreeMB", DEFAULT_SMART_FREE_MB, NULL)
+				);
+
+				_r_menu_setitemtextformat (
+					hmenu,
+					IDM_PAGEFILEGUARD_CHK,
+					FALSE,
+					_r_locale_getstring (IDS_PAGEFILEGUARD_CHK),
+					_r_calc_clamp (_r_config_getulong_ex (L"PagefileGuardPercent", DEFAULT_PAGEFILE_GUARD, NULL), 1, 100)
+				);
+
+				_r_menu_setitemtext (hmenu, IDM_CLEARPAGEFILE_CHK, FALSE, _r_locale_getstring (IDS_CLEARPAGEFILE_CHK));
 			}
 
 			// configure listview
-			for (INT i = 0, k = 0; i < 3; i++)
-			{
-				_r_listview_setgroup (hwnd, IDC_LISTVIEW, i, _r_locale_getstring (IDS_GROUP_1 + i), 0, 0);
+			for (INT i = 0; i < RTL_NUMBER_OF (app_group_titles); i++)
+				_r_listview_setgroup (hwnd, IDC_LISTVIEW, i, _r_locale_getstring (app_group_titles[i]), 0, 0);
 
-				for (INT j = 0; j < 3; j++)
-				{
-					_r_listview_setitem (hwnd, IDC_LISTVIEW, k++, 0, _r_locale_getstring (IDS_ITEM_1 + j), I_DEFAULT, I_DEFAULT, I_DEFAULT);
-				}
-			}
+			for (INT i = 0; i < RTL_NUMBER_OF (app_row_labels); i++)
+				_r_listview_setitem (hwnd, IDC_LISTVIEW, i, 0, _r_locale_getstring (app_row_labels[i]), I_DEFAULT, I_DEFAULT, I_DEFAULT);
 
 			// configure button
 			_r_ctrl_setstring (hwnd, IDC_CLEAN, _r_locale_getstring (IDS_CLEAN));
@@ -1951,6 +2657,12 @@ INT_PTR CALLBACK DlgProc (
 
 			EndPaint (hwnd, &ps);
 
+			break;
+		}
+
+		case RM_CLEANDONE:
+		{
+			_app_memoryclean_finish ((PAPP_CLEAN_CONTEXT)lparam);
 			break;
 		}
 
@@ -2287,6 +2999,45 @@ INT_PTR CALLBACK DlgProc (
 
 			switch (ctrl_id)
 			{
+				case IDM_PAGEFILE_REPORT:
+				{
+					_app_showpagefilereport (hwnd);
+					break;
+				}
+
+				case IDM_SMARTSTANDBY_CHK:
+				{
+					BOOLEAN new_val = _app_config_invertboolean (L"SmartStandbyEnable", FALSE, NULL);
+
+					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
+
+					break;
+				}
+
+				case IDM_PAGEFILEGUARD_CHK:
+				{
+					BOOLEAN new_val = _app_config_invertboolean (L"PagefileGuardEnable", TRUE, NULL);
+
+					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, new_val);
+
+					break;
+				}
+
+				case IDM_CLEARPAGEFILE_CHK:
+				{
+					BOOLEAN new_val = !_app_isclearpagefileenabled ();
+					LSTATUS status;
+
+					status = _app_setclearpagefile (new_val);
+
+					if (status != ERROR_SUCCESS)
+						_r_show_errormessage (hwnd, NULL, status, L"ClearPageFileAtShutdown", ET_WINDOWS);
+
+					_r_menu_checkitem (GetMenu (hwnd), ctrl_id, 0, MF_BYCOMMAND, _app_isclearpagefileenabled ());
+
+					break;
+				}
+
 				case IDM_ALWAYSONTOP_CHK:
 				{
 					BOOLEAN new_val = _app_config_invertboolean (L"AlwaysOnTop", FALSE, NULL);

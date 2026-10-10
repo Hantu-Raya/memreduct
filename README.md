@@ -26,6 +26,31 @@ You can download either the installer or portable version. For correct working y
 To activate portable mode, create "memreduct.ini" in application folder, or move it from "%APPDATA%\Henry++\Mem Reduct".
 ```
 
+### Fork additions (Windows 11 24H2/25H2):
+- Cleaning runs on a worker thread, so the window stays responsive (#312). Measured on 25H2 26200: 3.5.2 blocked its UI for the whole clean (299 ms here), the fork for at most 7 ms.
+- "Commit charge" (Task Manager "Committed"), "Memory lists" (standby/modified/free) and "Pagefiles" (one row per pagefile, used / size) groups. Percentages no longer show NaN when no pagefile exists (#262, #263).
+- **File → Pagefile report**: per-pagefile usage, peak and configured size, commit charge, modified pages bound for the pagefile, and the processes holding the most private memory outside RAM.
+- **Settings → Do not flush modified pages when pagefile is N% full** (default on, 90%): flushing the modified list writes into the pagefile, so it is skipped when the pagefile is nearly full.
+- **Settings → Wipe pagefile at shutdown**: toggles `ClearPageFileAtShutdown` (slower shutdown; zeroes the file each shutdown).
+- **Settings → Smart standby purge** (ISLC-style): purges the standby list only when standby > X MB and free < Y MB, at most every 30 s, silently.
+- "Modified file cache" flushes fixed local volumes only (no removable, network or offline volumes).
+- The automatic update check at startup is disabled so an upstream release cannot overwrite the fork; *Help → Check for updates* still works manually.
+
+About "cleaning the pagefile": measured on Windows 11 25H2, pagefile space is released only when the owning process frees or modifies that memory or exits. Reading pages back into RAM (prefetching, `ReadProcessMemory`, or touching them) does not release it, and no supported API releases it for another process. Writing into other processes' memory would risk corrupting data and trip anti-cheat/EDR, so the fork reports the space instead of rewriting foreign memory. Unused data sitting in the pagefile does not slow the system down; what does is heavy *paging activity*, which happens when commit is high and RAM is short.
+
+`memreduct.ini` keys (section `[memreduct]`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `PagefileGuardEnable` | `true` | Enable the pagefile guard |
+| `PagefileGuardPercent` | `90` | Pagefile usage (%) at which the modified page list is not flushed |
+| `SmartStandbyEnable` | `false` | Enable smart standby purge |
+| `SmartStandbyListMB` | `1024` | Purge when the standby list is at least this large... |
+| `SmartStandbyFreeMB` | `1024` | ...and free memory is below this |
+| `WorkingSetExclusions` | (empty) | `game.exe; obs64.exe` - processes skipped by working set trimming |
+
+Build without Visual Studio: `build_portable.bat [path\to\portable-msvc]` (toolchain from [portable-msvc.py](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977)), with the `routine` fork checked out next to this folder.
+
 ### System requirements:
 - Windows 7, 8, 8.1, 10, 11 (64-bit/ARM64)
 - An SSE2-capable CPU
