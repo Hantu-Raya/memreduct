@@ -57,6 +57,7 @@ Cleaning:
     - Sign with `python sign_version.py`; its `verify` applies the app's exact rules. The private key lives outside the repo (`E:\ram\keys\`). Never commit `*.pem`.
     - Test harness: `E:\ram\notes\sigtest\` (local server; cases in `make_manifest.py`); results in `E:\ram\notes\test3.md`.
     - The exe itself is not code-signed (SmartScreen may warn). Don't claim otherwise.
+  - Update dialog pages (`_r_update_navigate`) live in `R_UPDATE_INFO.page_config`/`page_content` (two alternating slots), never on the stack. The task dialog re-reads a page's `TASKDIALOGCONFIG` after `TDM_NAVIGATE_PAGE` returns. Pages sent from the check/download threads crashed 3.5.3.1 once those threads had exited (dump: UI thread reading `dwFlags` from a freed stack). Copy any caller text into the slot.
 
 ## Key Directories
 

@@ -1,3 +1,9 @@
+v3.5.3.3 (11 October 2026) - Mem Reduct++, unofficial Windows 11 fork by Hantu-Raya
+
+\- fixed a crash when an update finished downloading: the update dialog read page data from the stack of a background thread that had already exited (routine library)
+
+
+
 v3.5.3.2 (11 October 2026) - Mem Reduct++, unofficial Windows 11 fork by Hantu-Raya
 
 \- updates are installed only when the update information is signed with the maintainer's key and the downloaded file matches its SHA-256
