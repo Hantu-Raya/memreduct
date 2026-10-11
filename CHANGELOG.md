@@ -1,4 +1,4 @@
-v3.5.3-fork.1 (11 October 2026) - unofficial Windows 11 fork by Hantu-Raya, based on Mem Reduct 3.5.2 by Henry++
+v3.5.3.1 (11 October 2026) - Mem Reduct++, unofficial Windows 11 fork by Hantu-Raya, based on Mem Reduct 3.5.2 by Henry++
 
 \- cleaning runs on a worker thread, so the window no longer freezes while cleaning (issue #312)
 
@@ -20,7 +20,13 @@ v3.5.3-fork.1 (11 October 2026) - unofficial Windows 11 fork by Hantu-Raya, base
 
 \- fixed 1-4 minute intervals missing from the tray menu
 
-\- disabled the update check at startup; Help -> Check for updates and Website now point to the fork
+\- renamed to Mem Reduct++; settings folder and autorun entry stay "Mem Reduct", so it replaces an installed Mem Reduct in place
+
+\- updates now come from the fork: the startup check and Help -> Check for updates download the release exe, which replaces the installed copy and restarts it
+
+\- fixed the update dialog closing when an update was found (wrong argument order in the routine library)
+
+\- Help -> Website and About now point to the fork
 
 \- built with MSVC 14.51 and Windows SDK 10.0.28000
 

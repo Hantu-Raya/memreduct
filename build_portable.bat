@@ -17,7 +17,7 @@ set "OBJ=x64\Release\memreduct"
 if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OBJ%" mkdir "%OBJ%"
 
-set DEFS=/DMICROSOFT_WINDOWS_WINBASE_H_DEFINE_INTERLOCKED_CPLUSPLUS_OVERLOADS /D_UNICODE /DUNICODE /DWIN32_LEAN_AND_MEAN /DAPP_HAVE_AUTORUN /DAPP_HAVE_SKIPUAC /DAPP_HAVE_TRAY /DNDEBUG
+set DEFS=/DMICROSOFT_WINDOWS_WINBASE_H_DEFINE_INTERLOCKED_CPLUSPLUS_OVERLOADS /D_UNICODE /DUNICODE /DWIN32_LEAN_AND_MEAN /DAPP_HAVE_AUTORUN /DAPP_HAVE_SKIPUAC /DAPP_HAVE_TRAY /DAPP_HAVE_UPDATES /DNDEBUG
 set CFLAGS=/nologo /c /W3 /WX /O2 /Oi /Oy /Ob2 /GF /Gy /Gz /MT /Zi /sdl /guard:cf /guard:ehcont /std:clatest /Zc:preprocessor /QIntel-jcc-erratum /I..\routine\src /Isrc\include /Isrc /Fo%OBJ%\ /Fd%OBJ%\vc.pdb
 
 cl %CFLAGS% %DEFS% src\main.c ..\routine\src\routine.c ..\routine\src\rapp.c || exit /b 1

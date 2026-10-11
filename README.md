@@ -1,8 +1,8 @@
-<h1 align="center">Mem Reduct - unofficial Windows 11 fork</h1>
+<h1 align="center">Mem Reduct++</h1>
 
 <p align="center">
 	<b>Mem Reduct is created and maintained by <a href="https://github.com/henrypp">Henry++</a>.</b><br />
-	This is an unofficial fork of <a href="https://github.com/henrypp/memreduct">henrypp/memreduct</a> with Windows 11 24H2/25H2 fixes and pagefile tools.<br />
+	Mem Reduct++ is an unofficial fork of <a href="https://github.com/henrypp/memreduct">henrypp/memreduct</a> with Windows 11 24H2/25H2 fixes and pagefile tools.<br />
 	It is not affiliated with or endorsed by Henry++. Report problems with this fork <a href="https://github.com/Hantu-Raya/memreduct/issues">here</a>, not upstream.
 </p>
 
@@ -27,9 +27,9 @@ and clean system memory on your computer.
 The program used undocumented internal system features (Native API) to clear system cache (system working set, working set, standby page lists, modified page lists) with variable result ~10-50%. Application it is compatible with <s>Windows XP SP3</s> Windows 7 SP1 and higher operating systems.
 
 ### Download (fork build):
-Get the zip from [this fork's releases](https://github.com/Hantu-Raya/memreduct/releases). Builds are x64 only and labelled "unofficial Windows 11 fork" in *Help → About*. Official installer and portable builds by Henry++ are on [henrypp/memreduct releases](https://github.com/henrypp/memreduct/releases). Administrator rights are required for cleaning.
+Download `memreduct-plusplus-<version>-x64.exe` from [this fork's releases](https://github.com/Hantu-Raya/memreduct/releases) and run it, or put it in place of an installed `memreduct.exe`. Builds are x64 only; the window title says "Mem Reduct++" and *Help → About* says "unofficial Windows 11 fork". Official installer and portable builds by Henry++ are on [henrypp/memreduct releases](https://github.com/henrypp/memreduct/releases). Administrator rights are required for cleaning.
 
-The fork build keeps Mem Reduct's settings location, so it can replace an installed Mem Reduct and reuse its settings. Back up your copy first.
+Mem Reduct++ keeps Mem Reduct's settings folder (`%APPDATA%\Henry++\Mem Reduct`) and its "Load on system startup" entry, so it can replace an installed Mem Reduct and reuse its settings. Back up your copy first. Run only one of the two at a time.
 
 ```
 To activate portable mode, create "memreduct.ini" in application folder, or move it from "%APPDATA%\Henry++\Mem Reduct".
@@ -48,7 +48,7 @@ To activate portable mode, create "memreduct.ini" in application folder, or move
 - **Settings → Wipe pagefile at shutdown**: toggles `ClearPageFileAtShutdown` (slower shutdown; zeroes the file each shutdown).
 - **Settings → Smart standby purge** (ISLC-style): purges the standby list only when standby > X MB and free < Y MB, at most every 30 s, silently.
 - "Modified file cache" flushes fixed local volumes only (no removable, network or offline volumes).
-- The automatic update check at startup is disabled. *Help → Check for updates* and *Help → Website* point to this fork, so an official release cannot silently replace the fork and fork problems are not sent to Henry++.
+- Updates come from this fork: at startup (when *Settings → Periodically check for updates* is on) and from *Help → Check for updates*, Mem Reduct++ reads this repository's [`VERSION`](VERSION) file, downloads the newer release exe and replaces itself in place, keeping your settings. *Help → Website* opens this fork, so fork problems are not sent to Henry++.
 - Fixes for bugs that also exist upstream: the "Clean when above" and "Clean every" tray submenus are sorted by value (the sort compared array addresses), and intervals of 1–4 minutes show up and are ticked in the tray menu.
 
 About "cleaning the pagefile": measured on Windows 11 25H2, only the owning process can release its pagefile space by freeing or modifying (writing to) that memory, or exiting. The report's process ranking includes private commit that was never touched, so each amount is an upper bound on what that process could have in the pagefile, not a measurement of pagefile contents or an amount restarting it would necessarily release. Reading pages back into RAM (prefetching, `ReadProcessMemory`, or reading them) does not release pagefile space, and no supported API releases it for another process. Writing into other processes' memory would risk corrupting data and trip anti-cheat/EDR, so the fork displays actual per-pagefile usage instead of rewriting foreign memory. Unused data sitting in the pagefile does not slow the system down; what does is heavy *paging activity*, which happens when commit is high and RAM is short.
@@ -77,6 +77,9 @@ Build without Visual Studio: `build_portable.bat [path\to\portable-msvc]` (toolc
 - [Ethereum](https://www.blockchain.com/explorer/addresses/eth/0xe2C84A62eb2a4EF154b19bec0c1c106734B95960) (ETH)
 - [Yandex Money](https://yoomoney.ru/to/4100115776040583) (RUB)
 - [Paypal](https://paypal.me/henrypp) (USD)
+
+### Support the fork:
+- [Ko-fi](https://ko-fi.com/hanturaya) (Hantu-Raya, maintainer of Mem Reduct++)
 
 ### GPG Signature:
 Official Henry++ binaries have GPG signature `memreduct.exe.sig` in application folder. **Fork builds are not signed with this key**; check them against the SHA-256 published on the [fork release page](https://github.com/Hantu-Raya/memreduct/releases) instead.

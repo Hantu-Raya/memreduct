@@ -3422,6 +3422,166 @@ BOOLEAN NTAPI _app_parseargs (
 	return FALSE;
 }
 
+typedef struct _APP_UPDATE_TARGET
+{
+	LPCWSTR install_dir;
+	WCHAR path[MAX_PATH];
+	HANDLE hprocess;
+	HWND hwnd;
+} APP_UPDATE_TARGET, *PAPP_UPDATE_TARGET;
+
+BOOL CALLBACK _app_selfupdate_findwindow (
+	_In_ HWND hwnd,
+	_In_ LPARAM lparam
+)
+{
+	PAPP_UPDATE_TARGET target = (PAPP_UPDATE_TARGET)lparam;
+	WCHAR image_path[MAX_PATH];
+	ULONG length = RTL_NUMBER_OF (image_path);
+	ULONG pid = 0;
+	HANDLE hprocess;
+	LPWSTR file_name;
+
+	// routine tags the main window of every Mem Reduct build with the app name
+	if (!GetPropW (hwnd, APP_NAME) && !GetPropW (hwnd, APP_STORAGE_NAME))
+		return TRUE;
+
+	GetWindowThreadProcessId (hwnd, &pid);
+
+	hprocess = OpenProcess (PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
+
+	if (!hprocess)
+		return TRUE;
+
+	// only the copy running from the install folder is replaced
+	if (QueryFullProcessImageNameW (hprocess, 0, image_path, &length) && (file_name = wcsrchr (image_path, L'\\')) != NULL)
+	{
+		*file_name = UNICODE_NULL;
+
+		if (_wcsicmp (image_path, target->install_dir) == 0)
+		{
+			_r_str_printf (target->path, RTL_NUMBER_OF (target->path), L"%s\\%s", image_path, file_name + 1);
+
+			target->hprocess = hprocess;
+			target->hwnd = hwnd;
+
+			return FALSE;
+		}
+	}
+
+	CloseHandle (hprocess);
+
+	return TRUE;
+}
+
+// The update check downloads the release exe into the cache folder and runs it elevated as
+// "<exe> /u /S /D=<install folder>" (routine's NSIS installer convention). Fork releases ship
+// the plain exe, so it installs itself: close the copy running from the install folder, swap
+// the files and start the new copy. Returns TRUE when this process was an update run.
+BOOLEAN _app_selfupdate ()
+{
+	APP_UPDATE_TARGET target = {0};
+	WCHAR self_path[MAX_PATH] = {0};
+	WCHAR install_dir[MAX_PATH] = {0};
+	WCHAR old_path[MAX_PATH + 8];
+	LPCWSTR cmdline;
+	LPCWSTR dir;
+	LPWSTR *arga;
+	ULONG_PTR length;
+	INT numargs = 0;
+	BOOLEAN is_update = FALSE;
+
+	GetModuleFileNameW (NULL, self_path, RTL_NUMBER_OF (self_path));
+
+	cmdline = GetCommandLineW ();
+	arga = CommandLineToArgvW (cmdline, &numargs);
+
+	if (arga)
+	{
+		for (INT i = 1; i < numargs; i++)
+		{
+			if (_wcsicmp (arga[i], L"/u") == 0)
+				is_update = TRUE;
+		}
+
+		LocalFree (arga);
+	}
+
+	// "/D=" is the last argument and is never quoted, even when it contains spaces
+	dir = wcsstr (cmdline, L" /D=");
+
+	if (!is_update || !dir)
+	{
+		// leftover from a previous update; it can only be deleted once that copy has exited
+		_r_str_printf (old_path, RTL_NUMBER_OF (old_path), L"%s.old", self_path);
+		DeleteFileW (old_path);
+
+		return FALSE;
+	}
+
+	_r_str_copy (install_dir, RTL_NUMBER_OF (install_dir), dir + 4);
+
+	length = _r_str_getlength (install_dir);
+
+	while (length && (install_dir[length - 1] == L' ' || install_dir[length - 1] == L'\\' || install_dir[length - 1] == L'"'))
+		install_dir[--length] = UNICODE_NULL;
+
+	if (!length)
+		return TRUE;
+
+	target.install_dir = install_dir;
+
+	EnumWindows (&_app_selfupdate_findwindow, (LPARAM)&target);
+
+	if (!target.path[0])
+		_r_str_printf (target.path, RTL_NUMBER_OF (target.path), L"%s\\%s.exe", install_dir, APP_NAME_SHORT);
+
+	if (_wcsicmp (self_path, target.path) == 0)
+		return TRUE;
+
+	// the running copy may be showing the update dialog; it exits through its own Exit command
+	if (target.hprocess)
+	{
+		PostMessageW (target.hwnd, WM_COMMAND, MAKEWPARAM (IDM_TRAY_EXIT, 0), 0);
+
+		if (WaitForSingleObject (target.hprocess, 15000) != WAIT_OBJECT_0)
+		{
+			TerminateProcess (target.hprocess, ERROR_SUCCESS);
+			WaitForSingleObject (target.hprocess, 5000);
+		}
+
+		CloseHandle (target.hprocess);
+	}
+
+	_r_str_printf (old_path, RTL_NUMBER_OF (old_path), L"%s.old", target.path);
+
+	DeleteFileW (old_path);
+
+	// keep the installed copy until the new one is in place, so a failed copy can be undone
+	if (GetFileAttributesW (target.path) != INVALID_FILE_ATTRIBUTES && !MoveFileExW (target.path, old_path, MOVEFILE_REPLACE_EXISTING))
+	{
+		MessageBoxW (NULL, L"Could not replace the installed copy. It was left unchanged.", APP_NAME, MB_OK | MB_ICONERROR);
+	}
+	else if (!CopyFileW (self_path, target.path, FALSE))
+	{
+		MoveFileExW (old_path, target.path, MOVEFILE_REPLACE_EXISTING);
+
+		MessageBoxW (NULL, L"Could not install the update. The previous version was restored.", APP_NAME, MB_OK | MB_ICONERROR);
+	}
+	else if (!DeleteFileW (old_path))
+	{
+		MoveFileExW (old_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+	}
+
+	// the downloaded copy in the cache folder is no longer needed
+	MoveFileExW (self_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+
+	if ((INT_PTR)ShellExecuteW (NULL, NULL, target.path, NULL, install_dir, SW_SHOWNORMAL) <= 32)
+		MessageBoxW (NULL, L"The update was installed, but the program could not be started.", APP_NAME, MB_OK | MB_ICONWARNING);
+
+	return TRUE;
+}
+
 INT APIENTRY wWinMain (
 	_In_ HINSTANCE hinst,
 	_In_opt_ HINSTANCE prev_hinst,
@@ -3430,6 +3590,9 @@ INT APIENTRY wWinMain (
 )
 {
 	HWND hwnd;
+
+	if (_app_selfupdate ())
+		return ERROR_SUCCESS;
 
 	if (!_r_app_initialize (&_app_parseargs))
 		return ERROR_APP_INIT_FAILURE;
