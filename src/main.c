@@ -3,6 +3,10 @@
 
 #include "routine.h"
 
+#include <exdisp.h> // IShellWindows (self-update relaunch through the desktop shell)
+#include <shldisp.h> // IShellDispatch2, IShellFolderViewDual
+#include <shlguid.h> // SID_STopLevelBrowser
+
 #include "main.h"
 #include "compat.h"
 #include "rapp.h"
@@ -3474,6 +3478,126 @@ BOOL CALLBACK _app_selfupdate_findwindow (
 	return TRUE;
 }
 
+// Ask the running desktop shell to start the program, so it runs as the signed-in user and not
+// as this elevated updater (documented pattern: desktop folder view -> IShellDispatch2).
+BOOLEAN _app_selfupdate_shellexecute (
+	_In_ LPCWSTR path,
+	_In_ LPCWSTR directory
+)
+{
+	IShellWindows *shell_windows = NULL;
+	IDispatch *desktop_dispatch = NULL;
+	IServiceProvider *service_provider = NULL;
+	IShellBrowser *shell_browser = NULL;
+	IShellView *shell_view = NULL;
+	IDispatch *view_dispatch = NULL;
+	IShellFolderViewDual *folder_view = NULL;
+	IDispatch *app_dispatch = NULL;
+	IShellDispatch2 *shell_dispatch = NULL;
+	VARIANT var_empty;
+	VARIANT var_dir;
+	VARIANT var_show;
+	BSTR file = NULL;
+	LONG hwnd = 0;
+	HRESULT status;
+	BOOLEAN is_com;
+
+	is_com = SUCCEEDED (CoInitializeEx (NULL, COINIT_APARTMENTTHREADED));
+
+	VariantInit (&var_empty);
+	VariantInit (&var_dir);
+	VariantInit (&var_show);
+
+	status = CoCreateInstance (&CLSID_ShellWindows, NULL, CLSCTX_LOCAL_SERVER, &IID_IShellWindows, (PVOID_PTR)&shell_windows);
+
+	if (SUCCEEDED (status))
+		status = shell_windows->lpVtbl->FindWindowSW (shell_windows, &var_empty, &var_empty, SWC_DESKTOP, &hwnd, SWFO_NEEDDISPATCH, &desktop_dispatch);
+
+	if (SUCCEEDED (status))
+		status = desktop_dispatch ? desktop_dispatch->lpVtbl->QueryInterface (desktop_dispatch, &IID_IServiceProvider, (PVOID_PTR)&service_provider) : E_FAIL;
+
+	if (SUCCEEDED (status))
+		status = service_provider->lpVtbl->QueryService (service_provider, &SID_STopLevelBrowser, &IID_IShellBrowser, (PVOID_PTR)&shell_browser);
+
+	if (SUCCEEDED (status))
+		status = shell_browser->lpVtbl->QueryActiveShellView (shell_browser, &shell_view);
+
+	if (SUCCEEDED (status))
+		status = shell_view->lpVtbl->GetItemObject (shell_view, SVGIO_BACKGROUND, &IID_IDispatch, (PVOID_PTR)&view_dispatch);
+
+	if (SUCCEEDED (status))
+		status = view_dispatch->lpVtbl->QueryInterface (view_dispatch, &IID_IShellFolderViewDual, (PVOID_PTR)&folder_view);
+
+	if (SUCCEEDED (status))
+		status = folder_view->lpVtbl->get_Application (folder_view, &app_dispatch);
+
+	if (SUCCEEDED (status))
+		status = app_dispatch->lpVtbl->QueryInterface (app_dispatch, &IID_IShellDispatch2, (PVOID_PTR)&shell_dispatch);
+
+	if (SUCCEEDED (status))
+	{
+		file = SysAllocString (path);
+
+		var_dir.vt = VT_BSTR;
+		var_dir.bstrVal = SysAllocString (directory);
+
+		var_show.vt = VT_I4;
+		var_show.lVal = SW_SHOWNORMAL;
+
+		status = (file && var_dir.bstrVal) ? shell_dispatch->lpVtbl->ShellExecute (shell_dispatch, file, var_empty, var_dir, var_empty, var_show) : E_OUTOFMEMORY;
+	}
+
+	if (file)
+		SysFreeString (file);
+
+	VariantClear (&var_dir);
+
+	if (shell_dispatch)
+		shell_dispatch->lpVtbl->Release (shell_dispatch);
+
+	if (app_dispatch)
+		app_dispatch->lpVtbl->Release (app_dispatch);
+
+	if (folder_view)
+		folder_view->lpVtbl->Release (folder_view);
+
+	if (view_dispatch)
+		view_dispatch->lpVtbl->Release (view_dispatch);
+
+	if (shell_view)
+		shell_view->lpVtbl->Release (shell_view);
+
+	if (shell_browser)
+		shell_browser->lpVtbl->Release (shell_browser);
+
+	if (service_provider)
+		service_provider->lpVtbl->Release (service_provider);
+
+	if (desktop_dispatch)
+		desktop_dispatch->lpVtbl->Release (desktop_dispatch);
+
+	if (shell_windows)
+		shell_windows->lpVtbl->Release (shell_windows);
+
+	if (is_com)
+		CoUninitialize ();
+
+	return SUCCEEDED (status);
+}
+
+// Start the installed copy as the signed-in user: it uses that user's settings and elevates
+// itself again through its skip-UAC task if that is on. Falls back to a direct start.
+BOOLEAN _app_selfupdate_launch (
+	_In_ LPCWSTR path,
+	_In_ LPCWSTR directory
+)
+{
+	if (_app_selfupdate_shellexecute (path, directory))
+		return TRUE;
+
+	return ((INT_PTR)ShellExecuteW (NULL, NULL, path, NULL, directory, SW_SHOWNORMAL) > 32);
+}
+
 // The update check downloads the release exe into the cache folder and runs it elevated as
 // "<exe> /u /S /D=<install folder>" (routine's NSIS installer convention). Fork releases ship
 // the plain exe, so it installs itself: close the copy running from the install folder, swap
@@ -3483,15 +3607,19 @@ BOOLEAN _app_selfupdate ()
 	APP_UPDATE_TARGET target = {0};
 	WCHAR self_path[MAX_PATH] = {0};
 	WCHAR install_dir[MAX_PATH] = {0};
-	WCHAR old_path[MAX_PATH + 8];
+	WCHAR old_path[MAX_PATH];
+	WCHAR message[MAX_PATH + 160];
 	LPCWSTR cmdline;
-	LPCWSTR dir;
+	LPCWSTR dir = NULL;
+	LPCWSTR next;
 	LPWSTR *arga;
 	ULONG_PTR length;
+	ULONG attributes;
 	INT numargs = 0;
 	BOOLEAN is_update = FALSE;
+	BOOLEAN is_installed = FALSE;
 
-	GetModuleFileNameW (NULL, self_path, RTL_NUMBER_OF (self_path));
+	length = GetModuleFileNameW (NULL, self_path, RTL_NUMBER_OF (self_path));
 
 	cmdline = GetCommandLineW ();
 	arga = CommandLineToArgvW (cmdline, &numargs);
@@ -3508,16 +3636,27 @@ BOOLEAN _app_selfupdate ()
 	}
 
 	// "/D=" is the last argument and is never quoted, even when it contains spaces
-	dir = wcsstr (cmdline, L" /D=");
+	for (next = wcsstr (cmdline, L" /D="); next; next = wcsstr (next + 1, L" /D="))
+		dir = next;
 
 	if (!is_update || !dir)
 	{
 		// leftover from a previous update; it can only be deleted once that copy has exited
-		_r_str_printf (old_path, RTL_NUMBER_OF (old_path), L"%s.old", self_path);
-		DeleteFileW (old_path);
+		if (length && length < RTL_NUMBER_OF (self_path) - 4)
+		{
+			_r_str_printf (old_path, RTL_NUMBER_OF (old_path), L"%s.old", self_path);
+			DeleteFileW (old_path);
+		}
 
 		return FALSE;
 	}
+
+	// from here on this process is an update run and never starts the normal program
+	if (!length || length >= RTL_NUMBER_OF (self_path))
+		return TRUE;
+
+	if (_r_str_getlength (dir + 4) >= RTL_NUMBER_OF (install_dir))
+		return TRUE;
 
 	_r_str_copy (install_dir, RTL_NUMBER_OF (install_dir), dir + 4);
 
@@ -3526,7 +3665,14 @@ BOOLEAN _app_selfupdate ()
 	while (length && (install_dir[length - 1] == L' ' || install_dir[length - 1] == L'\\' || install_dir[length - 1] == L'"'))
 		install_dir[--length] = UNICODE_NULL;
 
-	if (!length)
+	// an existing absolute folder, short enough for "<folder>\memreduct.exe.old" (a misparsed
+	// command line such as "/D=C:\x /u /S" names a folder that does not exist)
+	attributes = GetFileAttributesW (install_dir);
+
+	if (length < 3 || length + 20 >= MAX_PATH || !(install_dir[1] == L':' || (install_dir[0] == L'\\' && install_dir[1] == L'\\')))
+		return TRUE;
+
+	if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
 		return TRUE;
 
 	target.install_dir = install_dir;
@@ -3536,8 +3682,21 @@ BOOLEAN _app_selfupdate ()
 	if (!target.path[0])
 		_r_str_printf (target.path, RTL_NUMBER_OF (target.path), L"%s\\%s.exe", install_dir, APP_NAME_SHORT);
 
-	if (_wcsicmp (self_path, target.path) == 0)
+	if (_r_str_getlength (target.path) + 4 >= RTL_NUMBER_OF (old_path))
+	{
+		if (target.hprocess)
+			CloseHandle (target.hprocess);
+
 		return TRUE;
+	}
+
+	if (_wcsicmp (self_path, target.path) == 0)
+	{
+		if (target.hprocess)
+			CloseHandle (target.hprocess);
+
+		return TRUE;
+	}
 
 	// the running copy may be showing the update dialog; it exits through its own Exit command
 	if (target.hprocess)
@@ -3555,28 +3714,53 @@ BOOLEAN _app_selfupdate ()
 
 	_r_str_printf (old_path, RTL_NUMBER_OF (old_path), L"%s.old", target.path);
 
-	DeleteFileW (old_path);
+	// an earlier failed update may have left the only intact copy as ".old"
+	if (GetFileAttributesW (target.path) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW (old_path) != INVALID_FILE_ATTRIBUTES)
+		MoveFileExW (old_path, target.path, 0);
 
-	// keep the installed copy until the new one is in place, so a failed copy can be undone
-	if (GetFileAttributesW (target.path) != INVALID_FILE_ATTRIBUTES && !MoveFileExW (target.path, old_path, MOVEFILE_REPLACE_EXISTING))
+	if (GetFileAttributesW (target.path) != INVALID_FILE_ATTRIBUTES)
 	{
-		MessageBoxW (NULL, L"Could not replace the installed copy. It was left unchanged.", APP_NAME, MB_OK | MB_ICONERROR);
-	}
-	else if (!CopyFileW (self_path, target.path, FALSE))
-	{
-		MoveFileExW (old_path, target.path, MOVEFILE_REPLACE_EXISTING);
+		SetFileAttributesW (old_path, FILE_ATTRIBUTE_NORMAL);
+		DeleteFileW (old_path);
 
-		MessageBoxW (NULL, L"Could not install the update. The previous version was restored.", APP_NAME, MB_OK | MB_ICONERROR);
+		// keep the installed copy until the new one is in place, so a failed copy can be undone
+		if (!MoveFileExW (target.path, old_path, MOVEFILE_REPLACE_EXISTING))
+		{
+			MessageBoxW (NULL, L"Could not replace the installed copy. It was left unchanged.", APP_NAME, MB_OK | MB_ICONERROR);
+
+			_app_selfupdate_launch (target.path, install_dir);
+
+			return TRUE;
+		}
+
+		is_installed = TRUE;
 	}
-	else if (!DeleteFileW (old_path))
+
+	if (!CopyFileW (self_path, target.path, FALSE))
 	{
-		MoveFileExW (old_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+		if (is_installed && !MoveFileExW (old_path, target.path, MOVEFILE_REPLACE_EXISTING))
+		{
+			_r_str_printf (message, RTL_NUMBER_OF (message), L"Could not install the update, and the previous version could not be put back. It is saved as:\r\n%s", old_path);
+
+			MessageBoxW (NULL, message, APP_NAME, MB_OK | MB_ICONERROR);
+
+			return TRUE;
+		}
+
+		MessageBoxW (NULL, is_installed ? L"Could not install the update. The previous version was restored." : L"Could not install the update.", APP_NAME, MB_OK | MB_ICONERROR);
+	}
+	else if (is_installed)
+	{
+		SetFileAttributesW (old_path, FILE_ATTRIBUTE_NORMAL);
+
+		if (!DeleteFileW (old_path))
+			MoveFileExW (old_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 	}
 
 	// the downloaded copy in the cache folder is no longer needed
 	MoveFileExW (self_path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 
-	if ((INT_PTR)ShellExecuteW (NULL, NULL, target.path, NULL, install_dir, SW_SHOWNORMAL) <= 32)
+	if (GetFileAttributesW (target.path) != INVALID_FILE_ATTRIBUTES && !_app_selfupdate_launch (target.path, install_dir))
 		MessageBoxW (NULL, L"The update was installed, but the program could not be started.", APP_NAME, MB_OK | MB_ICONWARNING);
 
 	return TRUE;
