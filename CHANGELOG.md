@@ -1,3 +1,31 @@
+v3.5.3-fork.1 (11 October 2026) - unofficial Windows 11 fork by Hantu-Raya, based on Mem Reduct 3.5.2 by Henry++
+
+\- cleaning runs on a worker thread, so the window no longer freezes while cleaning (issue #312)
+
+\- added commit charge, memory lists (standby/modified/free) and one row per pagefile; no more NaN without a pagefile (issues #261, #262, #263, #281)
+
+\- added File -> Pagefile report
+
+\- added pagefile guard: skip the modified page flush when the pagefile is 90% full or more
+
+\- added "Wipe pagefile at shutdown" toggle
+
+\- added smart standby purge (standby > X MB and free < Y MB)
+
+\- added working set exclusions (WorkingSetExclusions in memreduct.ini)
+
+\- modified file cache flush now skips removable, network and offline volumes
+
+\- fixed tray submenus not sorted by value
+
+\- fixed 1-4 minute intervals missing from the tray menu
+
+\- disabled the update check at startup; Help -> Check for updates and Website now point to the fork
+
+\- built with MSVC 14.51 and Windows SDK 10.0.28000
+
+
+
 v3.5.2 (1 April 2025)
 
 \- added modified file cache clean
