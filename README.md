@@ -49,7 +49,7 @@ About "cleaning the pagefile": measured on Windows 11 25H2, only the owning proc
 | `SmartStandbyFreeMB` | `1024` | ...and free memory is below this |
 | `WorkingSetExclusions` | (empty) | `game.exe; obs64.exe` - processes skipped by working set trimming |
 
-Build without Visual Studio: `build_portable.bat [path\to\portable-msvc]` (toolchain from [portable-msvc.py](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977)), with the `routine` fork checked out next to this folder.
+Build without Visual Studio: `build_portable.bat [path\to\portable-msvc]` (toolchain from [portable-msvc.py](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977)), with the [routine fork](https://github.com/Hantu-Raya/routine/tree/fork/win11-pagefile) (branch `fork/win11-pagefile`) checked out as `..\routine` next to this folder.
 
 ### System requirements:
 - Windows 7, 8, 8.1, 10, 11 (64-bit/ARM64)
