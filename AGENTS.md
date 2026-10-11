@@ -41,7 +41,7 @@ Cleaning:
 - Updates (routine `rapp.c`):
   1. `_r_update_check` fetches `APP_UPDATE_URL`, which is this repo's `VERSION`.
   2. It compares versions with `_r_str_versioncompare` (4 parts, so `3.5.3.1 < 3.5.3.2`).
-  3. It downloads the app entry to `<cache>\update-memreduct-*.exe` and runs it elevated as `/u /S /D=<install dir>`.
+  3. It downloads the app entry to `<cache>\update-memreduct-*.exe`, checks it (below), and runs it elevated as `/u /S /H=<sha256> /D=<install dir>` (`/H=` since 3.5.3.2; `/D=` stays last).
   4. `_app_selfupdate` then:
      - takes the last ` /D=` and requires an existing absolute folder short enough for `<dir>\memreduct.exe.old`; anything else is a no-op that still exits;
      - posts `IDM_TRAY_EXIT` to the copy whose image is in that dir (window prop = `APP_NAME` or `APP_STORAGE_NAME`), terminating it if it is still running after 15 s;
@@ -49,9 +49,13 @@ Cleaning:
      - relaunches through the desktop shell (`IShellDispatch2::ShellExecute`), so the app runs as the signed-in user and re-elevates through its skip-UAC task. It falls back to a direct `ShellExecuteW`.
   - Activating a running instance also matches the `APP_STORAGE_NAME` title/prop (routine `_r_app_initialize`), so starting Mem Reduct++ while the original Mem Reduct runs shows that window.
   - Update authentication (routine, enabled by `APP_UPDATE_PUBKEY` in `app.h`, raw P-256 X||Y):
-    - `VERSION` must end with `signature=<r||s hex>`, an ECDSA P-256/SHA-256 signature over every byte before that line. `_r_update_verifymanifest` rejects the manifest otherwise, so unsigned manifests (all before 3.5.3.2) are ignored.
-    - Each record is `name=version|url|sha256`. `_r_update_verifyfile` checks the downloaded file's hash before it runs. A mismatch deletes the file and shows `STATUS_INVALID_IMAGE_HASH`.
-    - Sign with `python sign_version.py`. The private key lives outside the repo (`E:\ram\keys\`). Never commit `*.pem`.
+    - `VERSION` must end with `signature=<r||s hex>`, an ECDSA P-256/SHA-256 signature over the ASCII text before it (the CR of each CRLF removed). `_r_update_verifymanifest` rejects anything else: no signature, a lone CR, non-ASCII, text after the signature, or more than 64 KiB. Unsigned manifests (all before 3.5.3.2) are ignored.
+    - Each record is `name=version|url|sha256`. Installer records without a hash are refused.
+    - `_r_update_verifyfile` hashes the download through a handle that denies write/delete/rename. `_r_update_install` holds that handle until the elevated process starts and passes the hash as `/H=`. A mismatch deletes the file and shows `STATUS_INVALID_IMAGE_HASH`.
+    - `_app_selfupdate` with `/H=` pins its own file the same way and re-checks it before closing the old copy, keeping the pin through the copy. Without `/H=` (callers before 3.5.3.2) it uses the old path; keep that working.
+    - `_r_crypt_getfilehash` returns a hash only after a clean end of file.
+    - Sign with `python sign_version.py`; its `verify` applies the app's exact rules. The private key lives outside the repo (`E:\ram\keys\`). Never commit `*.pem`.
+    - Test harness: `E:\ram\notes\sigtest\` (local server; cases in `make_manifest.py`); results in `E:\ram\notes\test3.md`.
     - The exe itself is not code-signed (SmartScreen may warn). Don't claim otherwise.
 
 ## Key Directories
