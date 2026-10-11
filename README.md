@@ -27,6 +27,11 @@ To activate portable mode, create "memreduct.ini" in application folder, or move
 ```
 
 ### Fork additions (Windows 11 24H2/25H2):
+<p align="center">
+	<img src="/images/fork-main-window.png" alt="Main window with the new Commit charge, Memory lists and Pagefiles groups" />
+	<img src="/images/fork-pagefile-report.png" alt="File → Pagefile report" />
+</p>
+
 - Cleaning runs on a worker thread, so the window stays responsive (#312). Measured on 25H2 26200: 3.5.2 blocked its UI for the whole clean (299 ms here), the fork for at most 7 ms.
 - "Commit charge" (Task Manager "Committed"), "Memory lists" (standby/modified/free) and "Pagefiles" (one row per pagefile, used / size) groups. Percentages no longer show NaN when no pagefile exists (#262, #263).
 - **File → Pagefile report**: per-pagefile usage, peak and configured size, commit charge, modified pages bound for the pagefile, and processes ranked by private commit not in RAM (pagefile, compressed, or never touched). Each process amount is an upper bound on what it could have in the pagefile, not a measurement.
@@ -35,6 +40,7 @@ To activate portable mode, create "memreduct.ini" in application folder, or move
 - **Settings → Smart standby purge** (ISLC-style): purges the standby list only when standby > X MB and free < Y MB, at most every 30 s, silently.
 - "Modified file cache" flushes fixed local volumes only (no removable, network or offline volumes).
 - The automatic update check at startup is disabled so an upstream release cannot overwrite the fork; *Help → Check for updates* still works manually.
+- Fixes for bugs that also exist upstream: rows now turn the warning/danger colour; the "Clean when above" and "Clean every" tray submenus are sorted by value; intervals of 1–4 minutes show up and are ticked in the tray menu.
 
 About "cleaning the pagefile": measured on Windows 11 25H2, only the owning process can release its pagefile space by freeing or modifying (writing to) that memory, or exiting. The report's process ranking includes private commit that was never touched, so each amount is an upper bound on what that process could have in the pagefile, not a measurement of pagefile contents or an amount restarting it would necessarily release. Reading pages back into RAM (prefetching, `ReadProcessMemory`, or reading them) does not release pagefile space, and no supported API releases it for another process. Writing into other processes' memory would risk corrupting data and trip anti-cheat/EDR, so the fork displays actual per-pagefile usage instead of rewriting foreign memory. Unused data sitting in the pagefile does not slow the system down; what does is heavy *paging activity*, which happens when commit is high and RAM is short.
 
