@@ -40,8 +40,8 @@ INT WINAPIV compare_numbers (
 {
 	ULONG val1, val2;
 
-	val1 = PtrToUlong (ptr1);
-	val2 = PtrToUlong (ptr2);
+	val1 = *(const ULONG *)ptr1;
+	val2 = *(const ULONG *)ptr2;
 
 	if (val1 < val2)
 		return -1;
@@ -75,7 +75,7 @@ VOID _app_generate_array (
 
 	for (index = (value > 2) ? (value - 2) : 1; index <= (value + 2); index++)
 	{
-		if (index >= 5)
+		if (index >= 1)
 			_r_obj_addhashtableitem (hashtable, index, NULL);
 	}
 
@@ -217,12 +217,16 @@ VOID _app_getmemoryinfo_ex (
 	SYSTEM_PERFORMANCE_INFORMATION perf_info = {0};
 	APP_SYSTEM_MEMORY_LIST_INFORMATION mli = {0};
 	PSYSTEM_PAGEFILE_INFORMATION_EX pagefile;
-	ULONG64 buffer[0x400]; // 8 KB, 8-byte aligned
+	PVOID buffer;
 	PAPP_PAGEFILE entry;
 	ULONG64 standby_pages = 0;
+	ULONG buffer_length = 0x2000;
+	ULONG return_length = 0;
+	ULONG record_size;
 	ULONG page_size;
 	ULONG offset = 0;
 	ULONG name_length;
+	ULONG_PTR name_offset;
 	PWCHAR name;
 	BOOLEAN is_ex = TRUE;
 	NTSTATUS status;
@@ -253,19 +257,48 @@ VOID _app_getmemoryinfo_ex (
 	}
 
 	// SystemPageFileInformationEx adds configured min/max sizes (win8+)
-	status = NtQuerySystemInformation (SystemPageFileInformationEx, buffer, sizeof (buffer), NULL);
+	buffer = _r_mem_allocate (buffer_length);
 
-	if (!NT_SUCCESS (status))
+	for (;;)
 	{
-		is_ex = FALSE;
+		return_length = 0;
+		status = NtQuerySystemInformation (
+			is_ex ? SystemPageFileInformationEx : SystemPageFileInformation,
+			buffer,
+			buffer_length,
+			&return_length
+		);
 
-		status = NtQuerySystemInformation (SystemPageFileInformation, buffer, sizeof (buffer), NULL);
+		if (NT_SUCCESS (status))
+			break;
+
+		if (status == STATUS_INFO_LENGTH_MISMATCH || status == STATUS_BUFFER_TOO_SMALL)
+		{
+			if (buffer_length == 0x100000)
+				break;
+
+			buffer_length = min (max (return_length, buffer_length * 2), 0x100000UL);
+			buffer = _r_mem_reallocate (buffer, buffer_length);
+		}
+		else if (is_ex)
+		{
+			is_ex = FALSE;
+		}
+		else
+		{
+			break;
+		}
 	}
 
 	if (!NT_SUCCESS (status))
+	{
+		_r_mem_free (buffer);
 		return;
+	}
 
-	while (out_buffer->pagefile_count < APP_MAX_PAGEFILES && offset + sizeof (SYSTEM_PAGEFILE_INFORMATION) <= sizeof (buffer))
+	record_size = is_ex ? (ULONG)sizeof (SYSTEM_PAGEFILE_INFORMATION_EX) : (ULONG)sizeof (SYSTEM_PAGEFILE_INFORMATION);
+
+	while (out_buffer->pagefile_count < APP_MAX_PAGEFILES && offset <= buffer_length && buffer_length - offset >= record_size)
 	{
 		pagefile = PTR_ADD_OFFSET (buffer, offset);
 
@@ -279,7 +312,7 @@ VOID _app_getmemoryinfo_ex (
 		entry->used_bytes = (ULONG64)pagefile->TotalInUse * page_size;
 		entry->peak_bytes = (ULONG64)pagefile->PeakUsage * page_size;
 
-		if (is_ex && offset + sizeof (SYSTEM_PAGEFILE_INFORMATION_EX) <= sizeof (buffer))
+		if (is_ex)
 		{
 			entry->min_bytes = (ULONG64)pagefile->MinimumSize * page_size;
 			entry->max_bytes = (ULONG64)pagefile->MaximumSize * page_size;
@@ -287,9 +320,10 @@ VOID _app_getmemoryinfo_ex (
 
 		name = pagefile->PageFileName.Buffer;
 		name_length = pagefile->PageFileName.Length / sizeof (WCHAR);
+		name_offset = (ULONG_PTR)name - (ULONG_PTR)buffer;
 
 		// the name must point inside our buffer
-		if (name && (ULONG_PTR)name >= (ULONG_PTR)buffer && (ULONG_PTR)(name + name_length) <= (ULONG_PTR)buffer + sizeof (buffer))
+		if (name && (ULONG_PTR)name >= (ULONG_PTR)buffer && name_offset <= buffer_length && pagefile->PageFileName.Length <= buffer_length - name_offset)
 		{
 			// "\??\C:\pagefile.sys" -> "C:\pagefile.sys"
 			if (name_length >= 4 && name[0] == L'\\' && name[1] == L'?' && name[2] == L'?' && name[3] == L'\\')
@@ -309,11 +343,13 @@ VOID _app_getmemoryinfo_ex (
 			_r_str_printf (entry->name, RTL_NUMBER_OF (entry->name), L"#%" TEXT (PR_ULONG), out_buffer->pagefile_count);
 		}
 
-		if (!pagefile->NextEntryOffset)
+		if (!pagefile->NextEntryOffset || pagefile->NextEntryOffset < record_size || pagefile->NextEntryOffset > buffer_length - offset)
 			break;
 
 		offset += pagefile->NextEntryOffset;
 	}
+
+	_r_mem_free (buffer);
 }
 
 // Caller frees the returned buffer with _r_mem_free.
@@ -707,16 +743,20 @@ VOID _app_memoryclean_perform (
 	// Modified page list (vista+)
 	if ((mask & REDUCT_MODIFIEDLIST) == REDUCT_MODIFIEDLIST)
 	{
+		R_MEMORY_INFO mem_guard;
+
 		// pagefile guard: flushing writes pagefile-backed modified pages into the pagefile,
 		// so skip it when the pagefile is already nearly full
-		if (context->pagefile_guard && mem_info.page_file.total_bytes && mem_info.page_file.percent >= context->pagefile_guard)
+		_app_getmemoryinfo (&mem_guard);
+
+		if (context->pagefile_guard && mem_guard.page_file.total_bytes && mem_guard.page_file.percent >= context->pagefile_guard)
 		{
 			_r_str_printf (
 				context->notes,
 				RTL_NUMBER_OF (context->notes),
 				L"%s: skipped, pagefile %" TEXT (PR_ULONG) L"%% full",
 				_r_locale_getstring (IDS_MEMREGION_MODIFIEDLIST),
-				mem_info.page_file.percent
+				mem_guard.page_file.percent
 			);
 		}
 		else
@@ -786,7 +826,8 @@ VOID _app_memoryclean_finish (
 	CLEANUP_SOURCE_ENUM src = context->src;
 
 	// time of last cleaning
-	_r_config_setlong64_ex (L"StatisticLastReduct", _r_unixtime_now (), NULL);
+	if (src != SOURCE_SMART)
+		_r_config_setlong64_ex (L"StatisticLastReduct", _r_unixtime_now (), NULL);
 
 	_r_format_bytesize64 (buffer_cleaned_result, RTL_NUMBER_OF (buffer_cleaned_result), context->freed_bytes);
 
@@ -946,8 +987,9 @@ VOID _app_memoryclean (
 	if (InterlockedCompareExchange (&config.is_cleaning, TRUE, FALSE))
 		return;
 
-	// prevents the usage-based autoclean from re-triggering while the worker runs
-	_r_config_setlong64_ex (L"StatisticLastReduct", _r_unixtime_now (), NULL);
+	// prevents the usage-based autoclean from re-triggering while a non-smart clean runs
+	if (src != SOURCE_SMART)
+		_r_config_setlong64_ex (L"StatisticLastReduct", _r_unixtime_now (), NULL);
 
 	context = _r_mem_allocate (sizeof (APP_CLEAN_CONTEXT));
 
@@ -1139,7 +1181,8 @@ VOID _app_setrow (
 	_In_ ULONG percent
 )
 {
-	_r_listview_setitem (hwnd, IDC_LISTVIEW, item_id, 1, text, I_DEFAULT, I_DEFAULT, (LPARAM)percent);
+	_r_listview_setitem (hwnd, IDC_LISTVIEW, item_id, 1, text, I_DEFAULT, I_DEFAULT, I_DEFAULT);
+	_r_listview_setitem (hwnd, IDC_LISTVIEW, item_id, 0, NULL, I_DEFAULT, I_DEFAULT, (LPARAM)percent);
 }
 
 VOID _app_setrowbytes (
@@ -2358,6 +2401,7 @@ VOID _app_showpagefilereport (
 			private_bytes = process->PrivatePageCount;
 			resident_bytes = (ULONG64)process->WorkingSetPrivateSize.QuadPart;
 
+			// Includes committed pages never touched, not just pagefile contents.
 			bytes = (private_bytes > resident_bytes) ? (private_bytes - resident_bytes) : 0;
 
 			if (HandleToUlong (process->UniqueProcessId) && bytes)
@@ -2399,7 +2443,7 @@ VOID _app_showpagefilereport (
 		_r_mem_free (processes);
 	}
 
-	_r_str_append (buffer, buffer_length, L"\r\nPrivate memory not in RAM (pagefile or compressed), by process:\r\n");
+	_r_str_append (buffer, buffer_length, L"\r\nPrivate commit not in RAM (pagefile, compressed, or never touched), by process:\r\n");
 
 	for (ULONG i = 0; i < count; i++)
 	{
@@ -2411,8 +2455,9 @@ VOID _app_showpagefilereport (
 	_r_str_append (
 		buffer,
 		buffer_length,
-		L"\r\nWindows frees pagefile space only when the owning process frees or modifies that memory, "
-		L"or exits. Restarting the processes listed above releases their share; "
+		L"\r\nThese amounts are upper bounds on what each process could have in the pagefile, "
+		L"not measurements. Only the owning process can release its pagefile space by "
+		L"freeing or modifying (writing to) that memory, or exiting. "
 		L"\"Wipe pagefile at shutdown\" zeroes the file at every shutdown."
 	);
 
