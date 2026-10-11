@@ -3599,9 +3599,12 @@ BOOLEAN _app_selfupdate_launch (
 }
 
 // The update check downloads the release exe into the cache folder and runs it elevated as
-// "<exe> /u /S /D=<install folder>" (routine's NSIS installer convention). Fork releases ship
-// the plain exe, so it installs itself: close the copy running from the install folder, swap
-// the files and start the new copy. Returns TRUE when this process was an update run.
+// "<exe> /u /S [/H=<sha256>] /D=<install folder>" (routine's NSIS installer convention). Fork
+// releases ship the plain exe, so it installs itself: close the copy running from the install
+// folder, swap the files and start the new copy. Returns TRUE when this process was an update run.
+// /H= is the hash the caller checked against the signed manifest. This file sits in a
+// user-writable folder, so it is held unchangeable and checked against /H= again before anything
+// is replaced. Callers before 3.5.3.2 do not pass /H=.
 BOOLEAN _app_selfupdate ()
 {
 	APP_UPDATE_TARGET target = {0};
@@ -3610,6 +3613,11 @@ BOOLEAN _app_selfupdate ()
 	WCHAR old_path[MAX_PATH];
 	WCHAR message[MAX_PATH + 160];
 	LPCWSTR cmdline;
+	WCHAR expected_hash[65] = {0};
+	PR_STRING file_hash;
+	HANDLE hself = INVALID_HANDLE_VALUE;
+	BOOLEAN is_verified;
+	BOOLEAN is_copied;
 	LPCWSTR dir = NULL;
 	LPCWSTR next;
 	LPWSTR *arga;
@@ -3630,6 +3638,8 @@ BOOLEAN _app_selfupdate ()
 		{
 			if (_wcsicmp (arga[i], L"/u") == 0)
 				is_update = TRUE;
+			else if (!expected_hash[0] && _wcsnicmp (arga[i], L"/H=", 3) == 0 && _r_str_getlength (arga[i] + 3) == 64)
+				_r_str_copy (expected_hash, RTL_NUMBER_OF (expected_hash), arga[i] + 3);
 		}
 
 		LocalFree (arga);
@@ -3674,6 +3684,34 @@ BOOLEAN _app_selfupdate ()
 
 	if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY))
 		return TRUE;
+
+	if (expected_hash[0])
+	{
+		// deny writing, deleting and renaming until the copy below is done
+		hself = CreateFileW (self_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+		is_verified = FALSE;
+
+		if (hself != INVALID_HANDLE_VALUE)
+		{
+			if (NT_SUCCESS (_r_crypt_getfilehash (BCRYPT_SHA256_ALGORITHM, NULL, hself, &file_hash)))
+			{
+				is_verified = (_wcsicmp (file_hash->buffer, expected_hash) == 0);
+
+				_r_obj_dereference (file_hash);
+			}
+		}
+
+		if (!is_verified)
+		{
+			if (hself != INVALID_HANDLE_VALUE)
+				CloseHandle (hself);
+
+			MessageBoxW (NULL, L"The update file changed after it was checked, so it was not installed. The installed version was left unchanged.", APP_NAME, MB_OK | MB_ICONERROR);
+
+			return TRUE;
+		}
+	}
 
 	target.install_dir = install_dir;
 
@@ -3736,7 +3774,13 @@ BOOLEAN _app_selfupdate ()
 		is_installed = TRUE;
 	}
 
-	if (!CopyFileW (self_path, target.path, FALSE))
+	is_copied = !!CopyFileW (self_path, target.path, FALSE);
+
+	// any early return above ends the process, which closes the handle too
+	if (hself != INVALID_HANDLE_VALUE)
+		CloseHandle (hself);
+
+	if (!is_copied)
 	{
 		if (is_installed && !MoveFileExW (old_path, target.path, MOVEFILE_REPLACE_EXISTING))
 		{

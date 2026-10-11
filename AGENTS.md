@@ -48,7 +48,11 @@ Cleaning:
      - renames the installed exe to `.old`, copies itself in, and rolls back on failure; if the rollback fails too it keeps `.old`, says where, and doesn't relaunch;
      - relaunches through the desktop shell (`IShellDispatch2::ShellExecute`), so the app runs as the signed-in user and re-elevates through its skip-UAC task. It falls back to a direct `ShellExecuteW`.
   - Activating a running instance also matches the `APP_STORAGE_NAME` title/prop (routine `_r_app_initialize`), so starting Mem Reduct++ while the original Mem Reduct runs shows that window.
-  - The payload is not authenticated beyond HTTPS from this repo (no code signing). Don't claim otherwise.
+  - Update authentication (routine, enabled by `APP_UPDATE_PUBKEY` in `app.h`, raw P-256 X||Y):
+    - `VERSION` must end with `signature=<r||s hex>`, an ECDSA P-256/SHA-256 signature over every byte before that line. `_r_update_verifymanifest` rejects the manifest otherwise, so unsigned manifests (all before 3.5.3.2) are ignored.
+    - Each record is `name=version|url|sha256`. `_r_update_verifyfile` checks the downloaded file's hash before it runs. A mismatch deletes the file and shows `STATUS_INVALID_IMAGE_HASH`.
+    - Sign with `python sign_version.py`. The private key lives outside the repo (`E:\ram\keys\`). Never commit `*.pem`.
+    - The exe itself is not code-signed (SmartScreen may warn). Don't claim otherwise.
 
 ## Key Directories
 
@@ -152,5 +156,5 @@ There is no unit-test framework and no CI. Evidence comes from the `/WX` build p
   2. Add a CHANGELOG entry.
   3. Build and test.
   4. Tag `v3.5.3.N`.
-  5. Create a GitHub release with the asset `memreduct-plusplus-3.5.3.N-x64.exe` plus SHA-256.
-  6. Only then update and push `VERSION`. Every installed copy acts on it.
+  5. Create a GitHub release with the asset `memreduct-plusplus-3.5.3.N-x64.exe` plus SHA-256. Download it back and verify the hash.
+  6. Only then run `sign_version.py release` against the downloaded asset, verify, and push `VERSION`. Every installed copy acts on it.

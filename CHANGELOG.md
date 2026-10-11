@@ -1,3 +1,11 @@
+v3.5.3.2 (11 October 2026) - Mem Reduct++, unofficial Windows 11 fork by Hantu-Raya
+
+\- updates are installed only when the update information is signed with the maintainer's key and the downloaded file matches its SHA-256
+
+\- clear message when a downloaded update does not match the signed information
+
+
+
 v3.5.3.1 (11 October 2026) - Mem Reduct++, unofficial Windows 11 fork by Hantu-Raya, based on Mem Reduct 3.5.2 by Henry++
 
 \- cleaning runs on a worker thread, so the window no longer freezes while cleaning (issue #312)

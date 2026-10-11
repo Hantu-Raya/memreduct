@@ -39,3 +39,6 @@ desktop.ini
 *.tlog
 
 *PVS-Studio*
+
+# update signing keys never belong in the repository
+*.pem
